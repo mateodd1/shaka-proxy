@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.so
+build/
+*.egg-info/
+config.json
+channels.m3u
+token.json*
+hls/
+logs/
+*.m3u8

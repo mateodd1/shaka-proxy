@@ -1,0 +1,4 @@
+#EXTM3U
+# Add DASH channels here; keep this file private if it contains credentials.
+#EXTINF:-1,Example channel
+https://example.invalid/live/stream.mpd

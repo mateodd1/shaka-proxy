@@ -1,0 +1,10 @@
+{
+  "listen_host": "127.0.0.1", "listen_port": 8090, "public_base": "",
+  "source_m3u": "channels.m3u", "token_file": "token.json", "proxy_url": "",
+  "egress_bind": "", "egress_dns": "", "referer": "", "origin": "",
+  "default_ua": "Mozilla/5.0 Proxy-Shaka", "max_height": 1080,
+  "idle_seconds": 45, "max_channels": 8, "origin_concurrency": 4,
+  "cdn_retries": 3, "remux_timeout": 20, "segment_failures_before_skip": 2,
+  "hls_window": 6, "ffmpeg": "/usr/bin/ffmpeg", "packager": "bin/packager",
+  "hls_dir": "hls", "log_dir": "logs"
+}
