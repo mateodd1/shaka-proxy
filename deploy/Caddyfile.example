@@ -1,0 +1,13 @@
+# Replace the example domain and enable only the instance routes you use.
+tv.example.com {
+	handle_path /first/* {
+		reverse_proxy 127.0.0.1:8090 {
+			flush_interval -1
+		}
+	}
+	handle_path /second/* {
+		reverse_proxy 127.0.0.1:8091 {
+			flush_interval -1
+		}
+	}
+}

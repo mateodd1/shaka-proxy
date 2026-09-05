@@ -2,6 +2,7 @@ aiohttp>=3.10
 aiohttp-socks>=0.10
 Cython>=3.0
 setuptools>=70
+wheel
 requests
 PySocks
 pycryptodome

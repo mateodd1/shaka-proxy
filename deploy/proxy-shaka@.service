@@ -1,0 +1,20 @@
+[Unit]
+Description=Shaka streaming proxy (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proxy-shaka
+Group=proxy-shaka
+WorkingDirectory=/var/lib/proxy-shaka/%i
+Environment=PROXY_SHAKA_HOME=/var/lib/proxy-shaka/%i
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/proxy-shaka/.venv/bin/python /opt/proxy-shaka/run.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=8
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

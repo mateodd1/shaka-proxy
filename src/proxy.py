@@ -702,7 +702,7 @@ class EPG:
             if elem.tag == "channel":
                 channel_id = elem.get("id") or ""
                 for name in [channel_id] + [n.text or "" for n in elem.findall("display-name")]:
-                    slug = wanted.get(normalize_epg_name(name))
+                    slug = wanted.get(normalize_epg_name(name), "")
                     if slug:
                         channel_to_slug[channel_id] = slug
                         break
@@ -710,7 +710,7 @@ class EPG:
                 continue
             if elem.tag != "programme":
                 continue
-            slug = channel_to_slug.get(elem.get("channel") or "")
+            slug = channel_to_slug.get(elem.get("channel") or "", "")
             if slug:
                 start = parse_xmltv_time(elem.get("start") or "")
                 stop = parse_xmltv_time(elem.get("stop") or "")
