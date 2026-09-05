@@ -21,6 +21,24 @@ cp channels.example.m3u channels.m3u
 
 Edita `config.json` y `channels.m3u`. No guardes credenciales ni tokens en Git.
 
+El formato M3U admite las propiedades habituales de Kodi/InputStream Adaptive,
+incluidas `manifest_type=mpd`, `license_type=clearkey` y
+`license_key={kid:key}`. Las directivas `#KODIPROP` se consumen localmente y no
+se envían al cliente VLC. Para cada entrada DASH, el proxy publica la salida
+descifrada en `/live/<slug>/stream.ts`; también puedes usar el índice HLS
+`/live/<slug>/index.m3u8`.
+
+Ejemplo (usa valores propios y no publiques las claves):
+
+```m3u
+#EXTINF:-1 tvg-id="Canal HD" tvg-name="Canal",Canal
+#KODIPROP:inputstream=inputstream.adaptive
+#KODIPROP:inputstream.adaptive.manifest_type=mpd
+#KODIPROP:inputstream.adaptive.license_type=clearkey
+#KODIPROP:inputstream.adaptive.license_key={kid hexadecimal:key hexadecimal}
+https://cdn.example/live/index.mpd/Manifest?start=LIVE&end=END&device=DASH_AVC_FULLHD
+```
+
 ## Ejecución
 
 ```bash
