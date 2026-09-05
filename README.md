@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # proxy-shaka
 
 Proxy independiente DASH → MPEG-TS para VLC y otros clientes. Descarga
@@ -28,7 +27,7 @@ se envían al cliente VLC. Para cada entrada DASH, el proxy publica la salida
 descifrada en `/live/<slug>/stream.ts`; también puedes usar el índice HLS
 `/live/<slug>/index.m3u8`.
 
-Ejemplo (usa valores propios y no publiques las claves):
+Ejemplo
 
 ```m3u
 #EXTINF:-1 tvg-id="Canal HD" tvg-name="Canal",Canal
