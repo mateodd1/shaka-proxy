@@ -36,7 +36,7 @@ Ejemplo (usa valores propios y no publiques las claves):
 #KODIPROP:inputstream.adaptive.manifest_type=mpd
 #KODIPROP:inputstream.adaptive.license_type=clearkey
 #KODIPROP:inputstream.adaptive.license_key={kid hexadecimal:key hexadecimal}
-https://cdn.example/live/index.mpd/Manifest?start=LIVE&end=END&device=DASH_AVC_FULLHD
+https://cdn.example/live/index.mpd/
 ```
 
 ## Ejecución
