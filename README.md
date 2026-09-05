@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # proxy-shaka
 
 Proxy independiente DASH → MPEG-TS para VLC y otros clientes. Descarga
