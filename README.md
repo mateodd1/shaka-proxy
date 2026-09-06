@@ -15,6 +15,13 @@ La versión 1.0.1 corrige la retención de estado antiguo por segmento, las
 referencias relativas de URL y la aplicación de `proxy_url` a curl. Véase
 [la revisión conservadora y sus pruebas](REVIEW.md).
 
+La versión 1.0.2 añade un pequeño margen al inicio de `stream.ts`: espera media
+duración de segmento, hasta 3 segundos, antes de entregar el primero. El punto
+de entrada queda fijado en el último segmento disponible al abrir; así el
+productor puede preparar los siguientes. Esto añade algo de espera inicial,
+sin cambiar HLS, Shaka, FFmpeg ni la salida de red. Véase
+[el ajuste de arranque](STARTUP.md).
+
 ## Instalación
 
 Requiere Python 3.11+, un compilador C y las cabeceras de Python para compilar,

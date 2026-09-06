@@ -1756,6 +1756,8 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     )
     await resp.prepare(request)
     last_t: Optional[int] = None
+    join_t: Optional[int] = None
+    join_at = 0.0
     continuity = TSContinuity()
     expected_t: Optional[int] = None
     sess.viewers += 1
@@ -1783,10 +1785,14 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                 break
             entries = sess.ready_entries(pin=True)
             if last_t is None:
-                # The cache is shared, but each new client must join at the
-                # live edge. Replaying the oldest cached segment adds the
-                # whole cache window to late joiners' playback latency.
-                entries = entries[-1:]
+                # Pin the latest ready segment while a small startup margin
+                # builds. Chasing newer segments would discard that margin.
+                if entries and all(t != join_t for t, _d in entries):
+                    join_t, join_d = entries[-1]
+                    margin = min(3.0, join_d / max((sess.video.timescale if sess.video else 1), 1) / 2)
+                    join_at = min(started + 25.0, time.monotonic() + margin)
+                entries = ([entry for entry in entries if entry[0] == join_t]
+                           if time.monotonic() >= join_at else [])
             wrote = False
             for t, d in entries:
                 if last_t is not None and t <= last_t:
