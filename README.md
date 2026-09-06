@@ -100,7 +100,6 @@ Actualmente el proxy incluye, entre otras cosas:
 - [Logs](#logs)
 - [Tests](#tests)
 - [Limitaciones](#limitaciones)
-- [Seguridad](#seguridad)
 
 ---
 
@@ -1123,27 +1122,6 @@ A día de hoy:
 - FFmpeg y Shaka Packager siguen siendo dependencias externas.
 
 Si un MPD utiliza una estructura bastante distinta, seguramente haya que ampliar el parser.
-
----
-
-# Seguridad
-
-No subas al repositorio archivos reales que contengan:
-
-- claves;
-- tokens;
-- cookies;
-- credenciales;
-- URLs privadas.
-
-Para eso están:
-
-```text
-config.example.json
-channels.example.m3u
-```
-
-y los archivos reales deberían quedar fuera de Git.
 
 ---
 
