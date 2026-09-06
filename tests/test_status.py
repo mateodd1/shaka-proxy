@@ -1,4 +1,4 @@
-"""Status-page regressions for client counts and expandable channel cards."""
+"""Status-page regressions for client counts and expandable client lists."""
 import json
 import tempfile
 import unittest
@@ -44,7 +44,7 @@ class StatusPageTests(unittest.TestCase):
             [('192.0.2.10', 'VLC iOS', '1m 05s'), ('192.0.2.11', 'TiviMate', '5s')],
         )
 
-    def test_page_builds_numeric_accessible_expandable_client_cards(self):
+    def test_page_builds_numeric_accessible_expandable_client_list(self):
         page = proxy.render_status_page(proxy.session_snapshot(self.make_state()))
         self.assertIn("String(clients.length)", page)
         self.assertIn("aria-expanded", page)
@@ -52,7 +52,9 @@ class StatusPageTests(unittest.TestCase):
         self.assertIn("client-details", page)
         self.assertIn("expanded.has(ch.slug)", page)
         self.assertIn("client.ip", page)
-        self.assertNotIn("clients.forEach(client => {\n        const item", page)
+        self.assertIn("element('ul', 'client-list')", page)
+        self.assertIn("element('li', 'client')", page)
+        self.assertNotIn("grid-template-columns: repeat(auto-fit", page)
         initial = page.split('<script id="initial-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         data = json.loads(initial)
         self.assertEqual(len(data['live'][0]['clients']), 2)

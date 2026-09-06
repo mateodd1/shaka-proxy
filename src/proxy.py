@@ -2008,10 +2008,11 @@ def render_status_page(data: dict) -> str:
   .channel-summary[aria-expanded="true"] .client-arrow { transform: rotate(180deg); }
   .client-details td { padding: 0 13px 13px; background: var(--panel-2); }
   .client-list {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px;
-    padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #11161e;
+    margin: 0; padding: 0; list-style: none;
+    border: 1px solid var(--line); border-radius: 10px; background: #11161e;
   }
-  .client { min-width: 0; padding: 9px 10px; border-radius: 8px; background: #181e27; }
+  .client { min-width: 0; padding: 10px 12px; }
+  .client + .client { border-top: 1px solid var(--line); }
   .ua { color: #d8dde5; font-size: .78rem; overflow-wrap: anywhere; word-break: break-word; }
   .client-meta { margin-top: 3px; color: var(--muted); font-size: .7rem; overflow-wrap: anywhere; }
   .empty { margin: 0; padding: 42px 18px; text-align: center; color: var(--muted); }
@@ -2050,7 +2051,6 @@ def render_status_page(data: dict) -> str:
     }
     .client-details td { display: block; margin: 0; padding: 0; border: 0; background: transparent; }
     .client-details td::before { display: none; }
-    .client-list { grid-template-columns: 1fr; }
     .client .ua, .client-meta { max-width: none; text-align: left; }
   }
   @media (max-width: 520px) {
@@ -2172,9 +2172,9 @@ def render_status_page(data: dict) -> str:
     details.hidden = !open;
     const detailsCell = cell('Clientes');
     detailsCell.colSpan = 6;
-    const clientList = element('div', 'client-list');
+    const clientList = element('ul', 'client-list');
     clients.forEach(client => {
-      const item = element('div', 'client');
+      const item = element('li', 'client');
       item.append(element('div', 'ua', client.ua || 'Cliente sin identificar'));
       const metadata = [client.ip, client.connected].filter(Boolean).join(' · ');
       if (metadata) item.append(element('div', 'client-meta', metadata));

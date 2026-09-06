@@ -26,6 +26,9 @@ La versión 1.0.3 muestra el número de clientes de cada canal en la página de
 estado. Al desplegar una tarjeta se ven los clientes conectados; el estado del
 desplegable se conserva mientras llegan las actualizaciones automáticas.
 
+La versión 1.0.4 presenta esos clientes como una lista vertical compacta dentro
+del canal desplegado, también en pantallas grandes.
+
 ## Instalación
 
 Requiere Python 3.11+, un compilador C y las cabeceras de Python para compilar,
