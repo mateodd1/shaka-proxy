@@ -22,6 +22,10 @@ productor puede preparar los siguientes. Esto añade algo de espera inicial,
 sin cambiar HLS, Shaka, FFmpeg ni la salida de red. Véase
 [el ajuste de arranque](STARTUP.md).
 
+La versión 1.0.3 muestra el número de clientes de cada canal en la página de
+estado. Al desplegar una tarjeta se ven los clientes conectados; el estado del
+desplegable se conserva mientras llegan las actualizaciones automáticas.
+
 ## Instalación
 
 Requiere Python 3.11+, un compilador C y las cabeceras de Python para compilar,

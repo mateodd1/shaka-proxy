@@ -1986,16 +1986,34 @@ def render_status_page(data: dict) -> str:
   tbody tr:last-child td { border-bottom: 0; }
   th { color: var(--muted); font-size: .69rem; font-weight: 650; text-transform: uppercase; letter-spacing: .065em; background: #121720; }
   tbody tr { transition: background .18s ease; }
-  tbody tr:hover { background: var(--panel-2); }
+  .channel-summary.has-clients { cursor: pointer; }
+  .channel-summary.has-clients:hover,
+  .channel-summary.has-clients:focus-visible,
+  .channel-summary[aria-expanded="true"] { background: var(--panel-2); outline: none; }
+  .channel-summary:focus-visible { box-shadow: inset 0 0 0 2px var(--blue); }
+  .channel-summary[aria-expanded="true"] td { border-bottom: 0; }
   .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, monospace; font-size: .84rem; }
   .muted { color: var(--muted); }
   .channel { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .channel strong { overflow-wrap: anywhere; }
   .logo, .logo-ph { width: 38px; height: 38px; flex: none; object-fit: contain; }
   .logo-ph { display: grid; place-items: center; border-radius: 9px; background: #222a36; color: var(--muted); font-size: .7rem; }
-  .client { margin-bottom: 7px; }
-  .client:last-child { margin-bottom: 0; }
-  .ua { max-width: 300px; color: #c5cbd4; font-size: .76rem; overflow-wrap: anywhere; word-break: break-word; }
+  .client-count-wrap { display: inline-flex; align-items: center; gap: 8px; }
+  .client-count {
+    display: inline-grid; min-width: 1.8rem; height: 1.8rem; padding: 0 .5rem;
+    place-items: center; border-radius: 999px; background: #222b38;
+    color: var(--text); font: 650 .82rem/1 ui-monospace, SFMono-Regular, monospace;
+  }
+  .client-arrow { color: var(--muted); font-size: .82rem; transition: transform .18s ease; }
+  .channel-summary[aria-expanded="true"] .client-arrow { transform: rotate(180deg); }
+  .client-details td { padding: 0 13px 13px; background: var(--panel-2); }
+  .client-list {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px;
+    padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #11161e;
+  }
+  .client { min-width: 0; padding: 9px 10px; border-radius: 8px; background: #181e27; }
+  .ua { color: #d8dde5; font-size: .78rem; overflow-wrap: anywhere; word-break: break-word; }
+  .client-meta { margin-top: 3px; color: var(--muted); font-size: .7rem; overflow-wrap: anywhere; }
   .empty { margin: 0; padding: 42px 18px; text-align: center; color: var(--muted); }
   [hidden] { display: none !important; }
   noscript p { padding: 12px; color: var(--amber); background: #332812; border-radius: 10px; }
@@ -2023,6 +2041,17 @@ def render_status_page(data: dict) -> str:
     }
     td:first-child::before { display: none; }
     .ua { max-width: min(58vw, 360px); text-align: right; }
+    .channel-summary[aria-expanded="true"] {
+      margin-bottom: 0; border-bottom: 0; border-radius: 12px 12px 0 0;
+    }
+    .client-details {
+      margin-top: 0; padding: 0 14px 12px; border-top: 0;
+      border-radius: 0 0 12px 12px; background: var(--panel-2);
+    }
+    .client-details td { display: block; margin: 0; padding: 0; border: 0; background: transparent; }
+    .client-details td::before { display: none; }
+    .client-list { grid-template-columns: 1fr; }
+    .client .ua, .client-meta { max-width: none; text-align: left; }
   }
   @media (max-width: 520px) {
     main { padding: 18px 12px calc(30px + env(safe-area-inset-bottom)); }
@@ -2063,6 +2092,7 @@ def render_status_page(data: dict) -> str:
   const tbody = byId('channel-body');
   const empty = byId('empty');
   const endpoint = new URL('status.json', window.location.href);
+  const expanded = new Set();
   let timer = 0;
   let loading = false;
 
@@ -2089,9 +2119,20 @@ def render_status_page(data: dict) -> str:
     return td;
   }
 
-  function channelRow(ch) {
-    const row = document.createElement('tr');
-    row.dataset.slug = ch.slug || '';
+  function channelRows(ch) {
+    const clients = Array.isArray(ch.clients) ? ch.clients : [];
+    const expandable = clients.length > 0;
+    const open = expandable && expanded.has(ch.slug);
+    const summary = document.createElement('tr');
+    const details = document.createElement('tr');
+    const detailsId = `client-details-${ch.slug || 'channel'}`;
+    summary.className = `channel-summary${expandable ? ' has-clients' : ''}`;
+    summary.dataset.slug = ch.slug || '';
+    summary.tabIndex = expandable ? 0 : -1;
+    summary.setAttribute('role', 'button');
+    summary.setAttribute('aria-expanded', String(open));
+    summary.setAttribute('aria-controls', detailsId);
+    if (!expandable) summary.setAttribute('aria-disabled', 'true');
     const nameCell = cell('Canal');
     const name = element('div', 'channel');
     if (ch.logo) {
@@ -2107,24 +2148,56 @@ def render_status_page(data: dict) -> str:
     }
     name.append(element('strong', '', ch.name || ch.slug || 'Canal'));
     nameCell.append(name);
-    row.append(nameCell);
-    row.append(cell('Activo', 'mono', duration(ch.active_s)));
-    row.append(cell('Sin tráfico', 'mono', duration(ch.idle_s)));
+    summary.append(nameCell);
+    summary.append(cell('Activo', 'mono', duration(ch.active_s)));
+    summary.append(cell('Sin tráfico', 'mono', duration(ch.idle_s)));
 
     const clientsCell = cell('Clientes');
-    if (Array.isArray(ch.clients) && ch.clients.length) {
-      ch.clients.forEach(client => {
-        const item = element('div', 'client');
-        item.append(element('div', 'ua', client.ua || 'Cliente sin identificar'));
-        clientsCell.append(item);
-      });
-    } else {
-      clientsCell.append(element('span', 'muted', ch.viewers ? String(ch.viewers) : '—'));
+    const countWrap = element('span', 'client-count-wrap');
+    const count = element('span', 'client-count', String(clients.length));
+    count.setAttribute('aria-label', `${clients.length} cliente${clients.length === 1 ? '' : 's'} conectado${clients.length === 1 ? '' : 's'}`);
+    countWrap.append(count);
+    if (expandable) {
+      const arrow = element('span', 'client-arrow', '⌄');
+      arrow.setAttribute('aria-hidden', 'true');
+      countWrap.append(arrow);
     }
-    row.append(clientsCell);
-    row.append(cell('Calidad', 'mono', ch.quality || '—'));
-    row.append(cell('Búfer', 'mono', `${Number(ch.cached) || 0} seg.`));
-    return row;
+    clientsCell.append(countWrap);
+    summary.append(clientsCell);
+    summary.append(cell('Calidad', 'mono', ch.quality || '—'));
+    summary.append(cell('Búfer', 'mono', `${Number(ch.cached) || 0} seg.`));
+
+    details.id = detailsId;
+    details.className = 'client-details';
+    details.hidden = !open;
+    const detailsCell = cell('Clientes');
+    detailsCell.colSpan = 6;
+    const clientList = element('div', 'client-list');
+    clients.forEach(client => {
+      const item = element('div', 'client');
+      item.append(element('div', 'ua', client.ua || 'Cliente sin identificar'));
+      const metadata = [client.ip, client.connected].filter(Boolean).join(' · ');
+      if (metadata) item.append(element('div', 'client-meta', metadata));
+      clientList.append(item);
+    });
+    detailsCell.append(clientList);
+    details.append(detailsCell);
+
+    function setOpen(value) {
+      if (!expandable) return;
+      if (value) expanded.add(ch.slug); else expanded.delete(ch.slug);
+      summary.setAttribute('aria-expanded', String(value));
+      details.hidden = !value;
+    }
+    if (expandable) {
+      summary.addEventListener('click', () => setOpen(!expanded.has(ch.slug)));
+      summary.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        setOpen(!expanded.has(ch.slug));
+      });
+    }
+    return [summary, details];
   }
 
   function render(data) {
@@ -2137,7 +2210,9 @@ def render_status_page(data: dict) -> str:
     tokenCard.classList.toggle('warning', !data.token_ok || left === null || Number(left) < 1800);
     byId('token').textContent = !data.token_ok ? 'No disponible' : left === null ? 'Desconocido' : Number(left) <= 0 ? 'Caducado' : duration(left);
     const fragment = document.createDocumentFragment();
-    live.forEach(ch => fragment.append(channelRow(ch)));
+    const slugs = new Set(live.map(ch => ch.slug));
+    expanded.forEach(slug => { if (!slugs.has(slug)) expanded.delete(slug); });
+    live.forEach(ch => channelRows(ch).forEach(row => fragment.append(row)));
     tbody.replaceChildren(fragment);
     table.hidden = live.length === 0;
     empty.hidden = live.length !== 0;
