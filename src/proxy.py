@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
 
@@ -896,6 +896,7 @@ class DashOrigin:
     async def _curl_hop(self, url: str, headers: dict[str, str]) -> tuple[int, bytes, str, str]:
         bind = (self.cfg.get("egress_bind") or "").strip()
         dns = (self.cfg.get("egress_dns") or "").strip()
+        proxy = (self.cfg.get("proxy_url") or "").strip()
         parsed = urlparse(url)
         host = parsed.hostname or ""
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -930,6 +931,8 @@ class DashOrigin:
             ]
             if bind:
                 cmd += ["--interface", bind]
+            elif proxy:
+                cmd += ["--proxy", proxy, "--noproxy", ""]
             if ip and host:
                 cmd += ["--resolve", f"{host}:{port}:{ip}"]
             for key, value in headers.items():
@@ -978,10 +981,7 @@ class DashOrigin:
                 for _hop in range(6):
                     status, body, final, loc = await self._curl_hop(current, headers)
                     if loc and status in (301, 302, 303, 307, 308):
-                        if loc.startswith("http://") or loc.startswith("https://"):
-                            current = loc
-                        else:
-                            current = str(final).rsplit("/", 1)[0] + "/" + loc.lstrip("/")
+                        current = urljoin(str(final), loc)
                         continue
                     self._fails = 0
                     return status, body, current
@@ -1044,7 +1044,7 @@ class DashOrigin:
             status, body, final = await self._get(url, headers)
         if status != 200:
             raise web.HTTPBadGateway(text=f"MPD HTTP {status}")
-        self.cdn_base[ch.slug] = final.rsplit("/", 1)[0] + "/"
+        self.cdn_base[ch.slug] = final
         return body
 
     async def fetch_rel(self, ch: Channel, rel: str, use_init_cache: bool = False) -> bytes:
@@ -1056,7 +1056,7 @@ class DashOrigin:
         if not base:
             await self.fetch_mpd(ch)
             base = self.cdn_base[ch.slug]
-        url = base + rel
+        url = urljoin(base, rel)
         headers = self.headers_for(ch)
         delay = 0.2
         for _ in range(3):
@@ -1096,6 +1096,7 @@ class ChannelSession:
         self.hls_dir = Path(cfg["hls_dir"]) / ch.slug
         empty_dir(self.hls_dir)
         self.locks: dict[int, asyncio.Lock] = {}
+        self._lock_users: dict[int, int] = {}
         self.refresh_lock = asyncio.Lock()
         self.sem = asyncio.Semaphore(2)
         self.stopped = False
@@ -1246,14 +1247,21 @@ class ChannelSession:
     @asynccontextmanager
     async def _segment_work(self, t: int):
         lock = self.locks.setdefault(t, asyncio.Lock())
-        async with lock:
-            try:
-                yield
-            finally:
-                # Only the lock owner may remove the working directory.
-                tmpdir = self.hls_dir / f".tmp-{t}"
-                if tmpdir.exists():
-                    shutil.rmtree(tmpdir, ignore_errors=True)
+        # Include queued and awakened waiters, even while lock.locked() is false.
+        self._lock_users[t] = self._lock_users.get(t, 0) + 1
+        try:
+            async with lock:
+                try:
+                    yield
+                finally:
+                    # Only the lock owner may remove the working directory.
+                    tmpdir = self.hls_dir / f".tmp-{t}"
+                    if tmpdir.exists():
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+        finally:
+            self._lock_users[t] -= 1
+            if not self._lock_users[t]:
+                self._lock_users.pop(t)
 
     async def _remux(self, t: int) -> Path:
         if self.stopped:
@@ -1433,6 +1441,19 @@ class ChannelSession:
         for t in list(self._published):
             if t not in keep:
                 self._published.pop(t, None)
+        if self.video and self.video.entries:
+            oldest = min(t for t, _d in self.video.entries)
+            if self._next_t is not None:
+                oldest = min(oldest, self._next_t)
+            # Retain recoverable/future timestamps, published media and all work
+            # users. Neither sequence allocation nor the transport clock resets.
+            protected = keep | self._lock_users.keys()
+            for state in (self.locks, self.t_to_seq, self._fail_t):
+                for t in list(state):
+                    if t < oldest and t not in protected:
+                        state.pop(t, None)
+            self._skip_t.difference_update(
+                {t for t in self._skip_t if t < oldest and t not in protected})
         for path in self.hls_dir.glob("seg_*.ts"):
             m = re.match(r"seg_(\d+)\.ts$", path.name)
             if not m or int(m.group(1)) in keep:

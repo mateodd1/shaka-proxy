@@ -11,6 +11,10 @@ anterior. El audio y el vídeo mantienen su reloj común entre fragmentos.
 La guía XMLTV ignora los canales ajenos a la lista, también en la versión
 compilada con Cython.
 
+La versión 1.0.1 corrige la retención de estado antiguo por segmento, las
+referencias relativas de URL y la aplicación de `proxy_url` a curl. Véase
+[la revisión conservadora y sus pruebas](REVIEW.md).
+
 ## Instalación
 
 Requiere Python 3.11+, un compilador C y las cabeceras de Python para compilar,
