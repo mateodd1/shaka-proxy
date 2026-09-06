@@ -412,7 +412,11 @@ def _rep_rank(rep: ET.Element) -> tuple[int, int]:
 
 
 def iso639(lang: str) -> str:
-    code = (lang or "").strip().lower()
+    code = (lang or "").strip().lower().replace("_", "-").split("-")[0]
+    code = {
+        "es": "spa", "en": "eng", "ca": "cat", "eu": "eus", "gl": "glg",
+        "fr": "fra", "de": "deu", "it": "ita", "pt": "por",
+    }.get(code, code)
     if len(code) >= 3 and code[:3].isalpha():
         return code[:3]
     return "und"
@@ -484,8 +488,8 @@ def select_tracks(
             if track is not None:
                 video, best_key = track, key
 
-    spa_sets = [aset for aset in audio_sets if aset.get("lang") == "spa"]
-    other_sets = [aset for aset in audio_sets if aset.get("lang") != "spa"]
+    spa_sets = [aset for aset in audio_sets if iso639(aset.get("lang") or "") == "spa"]
+    other_sets = [aset for aset in audio_sets if iso639(aset.get("lang") or "") != "spa"]
     audios: list[DashTrack] = []
     seen: set[str] = set()
     for aset in spa_sets + other_sets:
@@ -503,8 +507,6 @@ def select_tracks(
             continue
         seen.add(rid)
         audios.append(track)
-    spa = [a for a in audios if (a.lang or "").lower() == "spa"]
-    audios = spa[:1] or audios[:1]
     return video, audios
 
 

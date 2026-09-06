@@ -21,12 +21,21 @@ PACKAGER = ROOT / 'bin/packager'
 @unittest.skipUnless(Path(FFMPEG).exists() and Path(FFPROBE).exists() and PACKAGER.exists(), 'media binaries unavailable')
 class MuxTimestampTests(unittest.IsolatedAsyncioTestCase):
     async def test_segments_preserve_common_epoch_clock_and_audio_boundaries(self):
+        await self.check_audio_tracks(['spa'])
+
+    async def test_multiple_audios_survive_remux_in_spanish_first_order(self):
+        await self.check_audio_tracks(['eng', 'es-ES', 'cat'])
+
+    async def check_audio_tracks(self, languages):
         with tempfile.TemporaryDirectory(prefix='shaka-media-test-') as directory:
             root = Path(directory)
             command = [FFMPEG, '-hide_banner', '-v', 'error',
                        '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25',
                        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
-                       '-t', '6', '-c:v', 'libx264', '-preset', 'ultrafast',
+                       '-map', '0:v:0']
+            for i, lang in enumerate(languages):
+                command += ['-map', '1:a:0', f'-metadata:s:a:{i}', f'language={lang}']
+            command += ['-t', '6', '-c:v', 'libx264', '-preset', 'ultrafast',
                        '-b:v', '1500k', '-g', '50', '-bf', '2', '-c:a', 'aac',
                        '-output_ts_offset', '1700000000', '-f', 'dash', '-seg_duration', '2',
                        '-use_timeline', '1', '-use_template', '1',
@@ -43,6 +52,7 @@ class MuxTimestampTests(unittest.IsolatedAsyncioTestCase):
                 representation.remove(template)
                 adaptation.append(template)
             video, audio = proxy.select_tracks(ET.tostring(manifest), 1080)
+            self.assertEqual(len(audio), len(languages))
             async def fetch(ch, relative, **kwargs):
                 return (root / relative).read_bytes()
             origin = SimpleNamespace(work_sem=asyncio.Semaphore(1), fetch_rel=fetch)
@@ -59,7 +69,8 @@ class MuxTimestampTests(unittest.IsolatedAsyncioTestCase):
                 output.append(continuity.rewrite(path.read_bytes()))
             probe = await asyncio.to_thread(subprocess.run,
                 [FFPROBE, '-v', 'warning', '-show_packets', '-show_entries',
-                 'packet=stream_index,dts_time,duration_time', '-of', 'json', 'pipe:0'],
+                 'packet=stream_index,dts_time,duration_time:stream=index,codec_type:stream_tags=language',
+                 '-of', 'json', 'pipe:0'],
                 input=b''.join(output), capture_output=True, timeout=20)
             self.assertEqual(probe.returncode, 0, probe.stderr.decode())
             self.assertFalse(probe.stderr, probe.stderr.decode())
@@ -73,9 +84,15 @@ class MuxTimestampTests(unittest.IsolatedAsyncioTestCase):
                     self.assertAlmostEqual(timestamp, expected[index], delta=.00005)
                 expected[index] = timestamp + float(packet['duration_time'])
                 counts[index] = counts.get(index, 0) + 1
-            self.assertEqual(set(counts), {0, 1})
+            streams = json.loads(probe.stdout)['streams']
+            audio_streams = [s for s in streams if s['codec_type'] == 'audio']
+            expected_languages = sorted(
+                [proxy.iso639(lang) for lang in languages], key=lambda lang: lang != 'spa')
+            self.assertEqual([s['tags']['language'] for s in audio_streams], expected_languages)
+            self.assertEqual(set(counts), set(range(len(languages) + 1)))
             self.assertEqual(counts[0], 100)
-            self.assertGreater(counts[1], 100)
+            for index in range(1, len(languages) + 1):
+                self.assertGreater(counts[index], 100)
             self.assertFalse(list(session.hls_dir.glob('.tmp-*')))
 
 

@@ -322,17 +322,18 @@ También se ignoran representaciones que parecen estar destinadas a I-frames/tri
 
 El proxy busca los `AdaptationSet` de audio del MPD.
 
-Actualmente da prioridad a audio marcado como:
+Desde la versión 1.0.6 se incluyen todas las pistas de audio procesables, con una
+representación de la mejor calidad disponible por pista. El español aparece
+primero y se marca como predeterminado al remultiplexar; se reconocen `spa`,
+`es` y variantes como `es-ES`. Si no hay español se conserva el orden del MPD.
 
-```text
-lang="spa"
-```
+Cuando el contenido está cifrado también se comprueba que exista una clave
+conocida para el KID de cada pista. Los audios se incluyen tanto en `stream.ts`
+como en los segmentos TS de HLS, con su etiqueta de idioma.
 
-y, si no existe, utiliza otra pista disponible que pueda procesar.
-
-Cuando el contenido está cifrado también se comprueba que exista una clave conocida para el KID de la pista elegida.
-
-La salida normal utiliza una pista de audio.
+El reproductor puede aplicar su propia preferencia de idioma. Procesar más
+pistas aumenta las descargas y el trabajo por segmento; un fallo de audio
+mantiene los reintentos existentes para evitar publicar segmentos incompletos.
 
 ---
 

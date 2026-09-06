@@ -3,7 +3,7 @@ from Cython.Build import cythonize
 
 setup(
     name="proxy-shaka",
-    version="1.0.5",
+    version="1.0.6",
     ext_modules=cythonize(
         [Extension("proxy", ["src/proxy.py"])],
         compiler_directives={
