@@ -1950,7 +1950,7 @@ def render_status_page(data: dict) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Proxy Shaka · Estado</title>
+<title>Shaka-proxy · Estado</title>
 <style>
   :root {
     color-scheme: dark;
@@ -2067,7 +2067,7 @@ def render_status_page(data: dict) -> str:
 </head>
 <body>
 <main>
-  <header><h1>Proxy Shaka</h1></header>
+  <header><h1>Shaka-proxy</h1></header>
   <div class="cards">
     <div class="card"><div class="k">Canales abiertos</div><div id="open" class="v">—</div></div>
     <div class="card"><div class="k">Espectadores</div><div id="viewers" class="v">—</div></div>

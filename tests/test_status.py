@@ -46,6 +46,8 @@ class StatusPageTests(unittest.TestCase):
 
     def test_page_builds_numeric_accessible_expandable_client_list(self):
         page = proxy.render_status_page(proxy.session_snapshot(self.make_state()))
+        self.assertIn("<title>Shaka-proxy · Estado</title>", page)
+        self.assertIn("<header><h1>Shaka-proxy</h1></header>", page)
         self.assertIn("String(clients.length)", page)
         self.assertIn("aria-expanded", page)
         self.assertIn("aria-controls", page)
