@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import gzip
+import hashlib
 import html
 import io
 import json
@@ -552,6 +553,11 @@ def normalize_epg_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
+def public_channel_id(slug: str) -> str:
+    """Stable URL alias, independent of CDN tokens and process restarts."""
+    return hashlib.sha256(slug.encode("utf-8")).hexdigest()[:24]
+
+
 class Playlist:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -559,6 +565,7 @@ class Playlist:
         self.header = "#EXTM3U"
         self.channels: list[Channel] = []
         self.by_slug: dict[str, Channel] = {}
+        self.by_public_id: dict[str, Channel] = {}
 
     def maybe_reload(self, default_ua: str, default_referer: str) -> None:
         try:
@@ -630,6 +637,7 @@ class Playlist:
         self.header = header
         self.channels = channels
         self.by_slug = {ch.slug: ch for ch in channels}
+        self.by_public_id = {public_channel_id(ch.slug): ch for ch in channels}
 
     def epg_url(self) -> str:
         m = re.search(r'\burl-tvg="([^"]+)"', self.header, re.I)
@@ -1217,7 +1225,8 @@ class ChannelSession:
         for t, _d in entries:
             self._seq(t)
         base = (self.cfg.get("public_base") or "").rstrip("/")
-        prefix = f"{base}/live/{self.ch.slug}" if base else f"live/{self.ch.slug}"
+        channel_id = public_channel_id(self.ch.slug)
+        prefix = f"{base}/live/{channel_id}" if base else f"live/{channel_id}"
         durs = [d / self.video.timescale for _, d in entries]
         target = max(2, int(max(durs) + 0.999))
         lines = [
@@ -1576,9 +1585,11 @@ class AppState:
     async def get_session(self, slug: str) -> ChannelSession:
         async with self.lock:
             self.playlist.maybe_reload(self.cfg["default_ua"], self.cfg["referer"])
-            ch = self.playlist.by_slug.get(slug)
+            ch = self.playlist.by_public_id.get(slug) or self.playlist.by_slug.get(slug)
             if ch is None or not ch.is_dash:
                 raise web.HTTPNotFound(text="canal no encontrado")
+            # Both URL forms must share the same producer and segment cache.
+            slug = ch.slug
             sess = self.sessions.get(slug)
             if sess is None:
                 live = len(self.sessions)
@@ -1657,9 +1668,10 @@ def public_base(cfg: dict) -> str:
 
 def channel_url(cfg: dict, slug: str) -> str:
     base = public_base(cfg)
+    channel_id = public_channel_id(slug)
     if base:
-        return f"{base}/live/{slug}/stream.ts"
-    return f"live/{slug}/stream.ts"
+        return f"{base}/live/{channel_id}/stream.ts"
+    return f"live/{channel_id}/stream.ts"
 
 
 async def gather_owned(*aws):

@@ -26,13 +26,13 @@ MPD + segmentos DASH
 Al final, en vez de tener que abrir el MPD original y gestionar todo lo que hay detrás, el cliente puede usar una URL normal:
 
 ```text
-http://127.0.0.1:8090/live/canal/stream.ts
+http://127.0.0.1:8090/live/3e7c7e64b3c366ad87d1826a/stream.ts
 ```
 
 o:
 
 ```text
-http://127.0.0.1:8090/live/canal/index.m3u8
+http://127.0.0.1:8090/live/3e7c7e64b3c366ad87d1826a/index.m3u8
 ```
 
 > `shaka-proxy` no obtiene claves DRM ni solicita licencias. Las claves ClearKey, tokens, cookies o credenciales que necesite un origen deben ser proporcionadas por el usuario. Úsalo únicamente con contenido para el que tengas autorización.
@@ -110,7 +110,7 @@ Cuando alguien abre un canal, `shaka-proxy` crea una sesión para ese canal o re
 A partir de ahí el proceso es más o menos este:
 
 ```text
-Cliente pide /live/canal/stream.ts
+Cliente pide /live/3e7c7e64b3c366ad87d1826a/stream.ts
               │
               ▼
        cargar / actualizar MPD
@@ -454,13 +454,13 @@ Esto evita lanzar Shaka y FFmpeg dos veces para el mismo timestamp.
 La salida principal de un canal es:
 
 ```text
-/live/<slug>/stream.ts
+/live/<id>/stream.ts
 ```
 
 Ejemplo:
 
 ```bash
-vlc http://127.0.0.1:8090/live/canal-demo/stream.ts
+vlc http://127.0.0.1:8090/live/3e7c7e64b3c366ad87d1826a/stream.ts
 ```
 
 `stream.ts` es una respuesta HTTP continua.
@@ -480,13 +480,13 @@ X-Accel-Buffering: no
 También se genera:
 
 ```text
-/live/<slug>/index.m3u8
+/live/<id>/index.m3u8
 ```
 
 Los segmentos de la playlist se sirven en:
 
 ```text
-/live/<slug>/seg_<timestamp>.ts
+/live/<id>/seg_<timestamp>.ts
 ```
 
 El HLS utiliza la misma caché MPEG-TS que `stream.ts`, por lo que no hace falta volver a procesar el canal solo por utilizar la salida HLS.
@@ -496,7 +496,7 @@ La ventana se controla con `hls_window`.
 Ejemplo:
 
 ```bash
-vlc http://127.0.0.1:8090/live/canal-demo/index.m3u8
+vlc http://127.0.0.1:8090/live/3e7c7e64b3c366ad87d1826a/index.m3u8
 ```
 
 ---
@@ -664,7 +664,7 @@ https://cdn.example/manifest.mpd
 pasa a ser algo como:
 
 ```text
-http://127.0.0.1:8090/live/canal-demo/stream.ts
+http://127.0.0.1:8090/live/3e7c7e64b3c366ad87d1826a/stream.ts
 ```
 
 Las entradas de la M3U que no sean DASH pueden mantenerse como passthrough con su URL original.
@@ -673,29 +673,26 @@ De esta manera la misma lista puede mezclar canales procesados por `shaka-proxy`
 
 ---
 
-# Slugs
+# Identificadores de canal
 
-La URL de cada canal se genera a partir de su nombre.
-
-Por ejemplo:
-
-```text
-La 1 HD
-```
-
-se convierte en:
+Desde la versión 1.0.7, las URLs publicadas contienen un identificador opaco de
+24 caracteres hexadecimales. Por ejemplo, el canal `La 1` se sirve en:
 
 ```text
-la-1-hd
+/live/83abedb89a2c19d6032309a6/stream.ts
 ```
 
-y queda disponible como:
+El identificador se deriva del slug interno con SHA-256 y permanece estable al
+renovar tokens, regenerar listas y reiniciar el servicio. Si cambia el slug
+del canal en la lista de entrada, también cambia su identificador.
 
-```text
-/live/la-1-hd/stream.ts
-```
+La lista `/playlist.m3u8` proporciona las URLs correspondientes a cada canal.
+Los nombres y metadatos siguen visibles en la lista y en el panel de estado.
+HLS también publica los segmentos con el identificador opaco.
 
-Si dos canales terminan generando el mismo slug, se añaden sufijos para que sigan siendo únicos.
+Las URLs antiguas con slug siguen siendo compatibles y comparten la misma sesión
+y caché que las nuevas. Internamente se conservan los slugs y los sufijos que
+distinguen canales con nombres duplicados.
 
 ---
 
@@ -769,7 +766,7 @@ Los canales se crean bajo demanda.
 La primera petición a:
 
 ```text
-/live/canal/stream.ts
+/live/3e7c7e64b3c366ad87d1826a/stream.ts
 ```
 
 crea una sesión. Las siguientes reutilizan esa misma sesión mientras siga viva.
@@ -803,7 +800,7 @@ Por defecto las URLs se pueden construir a partir de la propia petición, pero s
 Entonces `/playlist.m3u8` utilizará:
 
 ```text
-https://tv.example.com/live/canal/stream.ts
+https://tv.example.com/live/3e7c7e64b3c366ad87d1826a/stream.ts
 ```
 
 También puede incluir un prefijo:
@@ -994,9 +991,9 @@ Endpoints útiles:
 | URL | Descripción |
 | --- | --- |
 | `/playlist.m3u8` | Playlist lista para usar. |
-| `/live/<slug>/stream.ts` | MPEG-TS continuo. |
-| `/live/<slug>/index.m3u8` | HLS. |
-| `/live/<slug>/seg_<t>.ts` | Segmentos HLS. |
+| `/live/<id>/stream.ts` | MPEG-TS continuo. |
+| `/live/<id>/index.m3u8` | HLS. |
+| `/live/<id>/seg_<t>.ts` | Segmentos HLS. |
 | `/status` | Estado en web. |
 | `/status.json` | Estado en JSON. |
 | `/epg` | Guía XMLTV. |
