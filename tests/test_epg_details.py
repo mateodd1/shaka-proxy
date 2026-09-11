@@ -60,6 +60,22 @@ class EPGMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(programme['description'], '')
         self.assertEqual(programme['category'], '')
         self.assertEqual(programme['title'], 'Programme')
+        self.assertEqual(programme['poster'], '')
+
+    async def test_programme_icon_preserves_url_and_resolves_relative_images(self):
+        for source, expected in (
+            ('https://images.example.test/poster.jpg?a=1&amp;b=2', 'https://images.example.test/poster.jpg?a=1&b=2'),
+            ('posters/one.jpg', 'https://example.test/posters/one.jpg'),
+        ):
+            with self.subTest(source=source):
+                programme = await self.load(f'<icon src="{source}"/>')
+                self.assertEqual(programme['poster'], expected)
+
+    async def test_empty_and_non_web_icons_are_ignored(self):
+        for source in ('', 'javascript:alert(1)', 'file:///etc/passwd', 'data:image/svg+xml,x'):
+            with self.subTest(source=source):
+                programme = await self.load(f'<icon src="{source}"/>')
+                self.assertEqual(programme['poster'], '')
 
 
 class EPGDetailsPageTests(unittest.TestCase):
@@ -84,6 +100,11 @@ class EPGDetailsPageTests(unittest.TestCase):
         self.assertEqual(details['description'], 'Sin descripción disponible.')
         self.assertEqual(details['category'], '')
         self.assertEqual(details['channel'], "Canal d'ejemplo")
+        self.assertEqual(details['poster'], '')
+
+    def test_poster_url_reaches_the_card_without_changing_its_query(self):
+        poster = 'https://images.example.test/poster.jpg?one=1&two=2'
+        self.assertEqual(PageParser(self.render(poster=poster)).details[0]['poster'], poster)
 
     def test_untrusted_epg_text_round_trips_without_becoming_markup(self):
         value = '''' " & </script><script>alert(1)</script><img src=x onerror=alert(1)>'''

@@ -729,6 +729,11 @@ class EPG:
                     title = (elem.findtext("title") or "Sin título").strip()
                     subtitle = (elem.findtext("sub-title") or "").strip()
                     description = (elem.findtext("desc") or "").strip()
+                    icon = elem.find("icon")
+                    poster = (icon.get("src") or "").strip() if icon is not None else ""
+                    poster = urljoin(url, poster) if poster else ""
+                    if not poster.startswith(("https://", "http://")):
+                        poster = ""
                     categories = list(dict.fromkeys(
                         category.text.strip() for category in elem.findall("category")
                         if category.text and category.text.strip()
@@ -736,6 +741,7 @@ class EPG:
                     programmes[slug].append({
                         "start": start, "stop": stop, "title": title, "subtitle": subtitle,
                         "description": description, "category": " · ".join(categories),
+                        "poster": poster,
                     })
             elem.clear()
         for items in programmes.values():
@@ -2314,6 +2320,7 @@ def render_epg_page(data: dict) -> str:
                 "title": p["title"], "subtitle": p["subtitle"],
                 "description": p.get("description") or "Sin descripción disponible.",
                 "category": p.get("category") or "",
+                "poster": p.get("poster") or "",
             }, ensure_ascii=False), quote=True)
             programme_html.append(
                 f"<div class='programme {'now' if is_now else ''}{' next' if is_next else ''}' style='--duration:{width}px' tabindex='0' data-programme='{details}'>"
@@ -2358,16 +2365,20 @@ def render_epg_page(data: dict) -> str:
   .programme strong,.subtitle {{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }} .empty-programme {{ --duration:180px; }}
   .label {{ font-size:.76rem; text-transform:uppercase; letter-spacing:.04em; }} .subtitle {{ color:#c2c6cc; font-size:.86rem; }}
   .notice {{ padding:12px 14px; border-radius:10px; background:#3a2d15; color:#f0d48a; }}
-  .programme[data-programme] {{ cursor:help; }}
+  .programme[data-programme] {{ cursor:default; }}
   .programme[data-programme]:hover,.programme[data-programme]:focus-visible {{ outline:2px solid #64d98b; outline-offset:-2px; }}
-  .programme-info {{ position:fixed; z-index:10; width:min(420px, calc(100vw - 24px)); max-height:min(440px, calc(100dvh - 24px)); overflow:auto; overscroll-behavior:contain; padding:18px 20px; border:1px solid #485562; border-radius:14px; background:#20252e; box-shadow:0 14px 44px #0008; overflow-wrap:anywhere; }}
+  .programme-info {{ position:fixed; z-index:10; width:min(460px, calc(100vw - 24px)); max-height:min(500px, calc(100dvh - 24px)); overflow:auto; overscroll-behavior:contain; padding:18px 20px; border:1px solid #485562; border-radius:14px; background:#20252e; box-shadow:0 14px 44px #0008; overflow-wrap:anywhere; }}
   .programme-info[hidden] {{ display:none; }}
+  .programme-info .info-heading {{ display:flex; align-items:flex-start; gap:16px; }}
+  .programme-info .info-poster {{ width:104px; height:152px; flex:none; object-fit:contain; border-radius:8px; background:#161a20; }}
+  .programme-info .info-poster[hidden] {{ display:none; }}
+  .programme-info .info-summary {{ flex:1; min-width:0; }}
   .programme-info .info-channel {{ color:#8fe3aa; font-size:.8rem; font-weight:600; }}
   .programme-info .info-time {{ margin-top:3px; color:#aeb7c4; font-size:.8rem; }}
-  .programme-info h2 {{ margin:10px 0 6px; font-size:1.08rem; line-height:1.35; }}
-  .programme-info .info-subtitle {{ margin:0 0 8px; color:#c2c6cc; font-size:.86rem; }}
-  .programme-info .info-category {{ margin:0 0 10px; color:#8fe3aa; font-size:.8rem; }}
-  .programme-info .info-description {{ margin:0; color:#e1e5eb; font-size:.9rem; line-height:1.55; white-space:pre-line; }}
+  .programme-info h2 {{ margin:0 0 8px; font-size:1.08rem; line-height:1.35; }}
+  .programme-info .info-subtitle {{ margin:8px 0 0; color:#c2c6cc; font-size:.86rem; }}
+  .programme-info .info-category {{ margin:8px 0 0; color:#8fe3aa; font-size:.8rem; }}
+  .programme-info .info-description {{ margin:14px 0 0; padding-top:14px; border-top:1px solid #353d49; color:#e1e5eb; font-size:.9rem; line-height:1.55; white-space:pre-line; }}
   @media (max-width:700px) {{
     main {{ padding:16px 12px 28px; }}
     .guide-head {{ display:none; }}
@@ -2389,17 +2400,23 @@ def render_epg_page(data: dict) -> str:
   <div class="epg-scroll"><section class="timeline"><div class="guide-head"><span>Canal</span><span>Programación · desliza para avanzar →</span></div>{''.join(rows)}</section></div>
 </main>
 <aside id="programme-info" class="programme-info" role="tooltip" hidden>
-  <div class="info-channel" data-field="channel"></div>
-  <div class="info-time" data-field="time"></div>
-  <h2 data-field="title"></h2>
-  <p class="info-subtitle" data-field="subtitle"></p>
-  <p class="info-category" data-field="category"></p>
+  <div class="info-heading">
+    <img class="info-poster" width="104" height="152" alt="" referrerpolicy="no-referrer" decoding="async" hidden>
+    <div class="info-summary">
+      <h2 data-field="title"></h2>
+      <div class="info-channel" data-field="channel"></div>
+      <div class="info-time" data-field="time"></div>
+      <p class="info-subtitle" data-field="subtitle"></p>
+      <p class="info-category" data-field="category"></p>
+    </div>
+  </div>
   <p class="info-description" data-field="description"></p>
 </aside>
 <script>
 (() => {{
   const guide = document.querySelector('.timeline');
   const info = document.getElementById('programme-info');
+  const poster = info.querySelector('.info-poster');
   let active = null, openTimer, closeTimer;
   const programme = target => target instanceof Element ? target.closest('[data-programme]') : null;
   function hide() {{
@@ -2429,6 +2446,9 @@ def render_epg_page(data: dict) -> str:
       field.textContent = value;
       field.hidden = !value;
     }});
+    poster.hidden = !details.poster;
+    if (details.poster) poster.src = details.poster;
+    else poster.removeAttribute('src');
     active = item;
     item.setAttribute('aria-describedby', info.id);
     info.hidden = false;
@@ -2460,6 +2480,11 @@ def render_epg_page(data: dict) -> str:
   guide.addEventListener('focusout', closeSoon);
   info.addEventListener('pointerenter', () => {{ clearTimeout(openTimer); clearTimeout(closeTimer); }});
   info.addEventListener('pointerleave', closeSoon);
+  poster.addEventListener('error', () => {{
+    if (!poster.complete || poster.naturalWidth) return;
+    poster.hidden = true;
+    position();
+  }});
   document.addEventListener('click', event => {{
     const item = programme(event.target);
     if (item) show(item);

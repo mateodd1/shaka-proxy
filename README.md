@@ -734,6 +734,10 @@ disponibles en XMLTV. También se puede abrir con el teclado o tocando el progra
 en el móvil. Se cierra con Escape o al pulsar fuera; permite mover el ratón sobre
 la ficha y desplazarse por descripciones largas.
 
+Desde la versión 1.0.9, la ficha muestra el póster XMLTV a la izquierda, el título
+y los datos a la derecha, y la sinopsis debajo. La imagen se carga al abrir la
+ficha y se oculta si no está disponible. El cursor del programa es el normal.
+
 ---
 
 # Estado
