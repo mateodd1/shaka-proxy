@@ -728,6 +728,12 @@ La guía se mantiene en memoria, se actualiza periódicamente y se puede consult
 /epg
 ```
 
+Desde la versión 1.0.8, al pasar el ratón sobre un programa se abre una ficha
+flotante con el canal, fecha y horario, título, subtítulo, categoría y sinopsis
+disponibles en XMLTV. También se puede abrir con el teclado o tocando el programa
+en el móvil. Se cierra con Escape o al pulsar fuera; permite mover el ratón sobre
+la ficha y desplazarse por descripciones largas.
+
 ---
 
 # Estado

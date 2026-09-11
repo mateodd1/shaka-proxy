@@ -728,7 +728,15 @@ class EPG:
                     stop = min(stop, datetime.fromtimestamp(horizon, tz=timezone.utc))
                     title = (elem.findtext("title") or "Sin título").strip()
                     subtitle = (elem.findtext("sub-title") or "").strip()
-                    programmes[slug].append({"start": start, "stop": stop, "title": title, "subtitle": subtitle})
+                    description = (elem.findtext("desc") or "").strip()
+                    categories = list(dict.fromkeys(
+                        category.text.strip() for category in elem.findall("category")
+                        if category.text and category.text.strip()
+                    ))
+                    programmes[slug].append({
+                        "start": start, "stop": stop, "title": title, "subtitle": subtitle,
+                        "description": description, "category": " · ".join(categories),
+                    })
             elem.clear()
         for items in programmes.values():
             items.sort(key=lambda p: p["start"])
@@ -2297,8 +2305,18 @@ def render_epg_page(data: dict) -> str:
             is_now = p["start"] <= now < p["stop"]
             is_next = p is item["next"]
             subtitle = f"<span class='subtitle'>{html.escape(p['subtitle'])}</span>" if p["subtitle"] else ""
+            local_start = p["start"].astimezone(ZoneInfo("Europe/Madrid"))
+            local_stop = p["stop"].astimezone(ZoneInfo("Europe/Madrid"))
+            stop_label = local_stop.strftime("%H:%M" if local_start.date() == local_stop.date() else "%d/%m %H:%M")
+            details = html.escape(json.dumps({
+                "channel": ch.name,
+                "time": f"{local_start:%d/%m · %H:%M}–{stop_label}",
+                "title": p["title"], "subtitle": p["subtitle"],
+                "description": p.get("description") or "Sin descripción disponible.",
+                "category": p.get("category") or "",
+            }, ensure_ascii=False), quote=True)
             programme_html.append(
-                f"<div class='programme {'now' if is_now else ''}{' next' if is_next else ''}' style='--duration:{width}px'>"
+                f"<div class='programme {'now' if is_now else ''}{' next' if is_next else ''}' style='--duration:{width}px' tabindex='0' data-programme='{details}'>"
                 f"<span class='label'>{'Ahora · ' if is_now else ('Después · ' if is_next else '')}{fmt_epg_time(p['start'])}–{fmt_epg_time(p['stop'])}</span>"
                 f"<strong>{html.escape(p['title'])}</strong>{subtitle}</div>"
             )
@@ -2340,6 +2358,16 @@ def render_epg_page(data: dict) -> str:
   .programme strong,.subtitle {{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }} .empty-programme {{ --duration:180px; }}
   .label {{ font-size:.76rem; text-transform:uppercase; letter-spacing:.04em; }} .subtitle {{ color:#c2c6cc; font-size:.86rem; }}
   .notice {{ padding:12px 14px; border-radius:10px; background:#3a2d15; color:#f0d48a; }}
+  .programme[data-programme] {{ cursor:help; }}
+  .programme[data-programme]:hover,.programme[data-programme]:focus-visible {{ outline:2px solid #64d98b; outline-offset:-2px; }}
+  .programme-info {{ position:fixed; z-index:10; width:min(420px, calc(100vw - 24px)); max-height:min(440px, calc(100dvh - 24px)); overflow:auto; overscroll-behavior:contain; padding:18px 20px; border:1px solid #485562; border-radius:14px; background:#20252e; box-shadow:0 14px 44px #0008; overflow-wrap:anywhere; }}
+  .programme-info[hidden] {{ display:none; }}
+  .programme-info .info-channel {{ color:#8fe3aa; font-size:.8rem; font-weight:600; }}
+  .programme-info .info-time {{ margin-top:3px; color:#aeb7c4; font-size:.8rem; }}
+  .programme-info h2 {{ margin:10px 0 6px; font-size:1.08rem; line-height:1.35; }}
+  .programme-info .info-subtitle {{ margin:0 0 8px; color:#c2c6cc; font-size:.86rem; }}
+  .programme-info .info-category {{ margin:0 0 10px; color:#8fe3aa; font-size:.8rem; }}
+  .programme-info .info-description {{ margin:0; color:#e1e5eb; font-size:.9rem; line-height:1.55; white-space:pre-line; }}
   @media (max-width:700px) {{
     main {{ padding:16px 12px 28px; }}
     .guide-head {{ display:none; }}
@@ -2360,7 +2388,101 @@ def render_epg_page(data: dict) -> str:
   <input id="filter" type="search" placeholder="Buscar canal" autocomplete="off">
   <div class="epg-scroll"><section class="timeline"><div class="guide-head"><span>Canal</span><span>Programación · desliza para avanzar →</span></div>{''.join(rows)}</section></div>
 </main>
-<script>document.getElementById('filter').addEventListener('input',e=>{{const q=e.target.value.trim().toLocaleLowerCase('es');document.querySelectorAll('.channel').forEach(x=>x.hidden=q&&!x.dataset.search.toLocaleLowerCase('es').includes(q));}});</script>
+<aside id="programme-info" class="programme-info" role="tooltip" hidden>
+  <div class="info-channel" data-field="channel"></div>
+  <div class="info-time" data-field="time"></div>
+  <h2 data-field="title"></h2>
+  <p class="info-subtitle" data-field="subtitle"></p>
+  <p class="info-category" data-field="category"></p>
+  <p class="info-description" data-field="description"></p>
+</aside>
+<script>
+(() => {{
+  const guide = document.querySelector('.timeline');
+  const info = document.getElementById('programme-info');
+  let active = null, openTimer, closeTimer;
+  const programme = target => target instanceof Element ? target.closest('[data-programme]') : null;
+  function hide() {{
+    clearTimeout(openTimer);
+    clearTimeout(closeTimer);
+    if (active) active.removeAttribute('aria-describedby');
+    active = null;
+    info.hidden = true;
+  }}
+  function position() {{
+    if (!active) return;
+    const rect = active.getBoundingClientRect();
+    const width = info.offsetWidth, height = info.offsetHeight;
+    const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+    let top = rect.bottom + 8;
+    if (top + height > window.innerHeight - 12) top = rect.top - height - 8;
+    top = Math.max(12, Math.min(top, window.innerHeight - height - 12));
+    info.style.left = left + 'px';
+    info.style.top = top + 'px';
+  }}
+  function show(item) {{
+    hide();
+    if (!item || !item.isConnected || item.closest('[hidden]')) return;
+    const details = JSON.parse(item.dataset.programme);
+    info.querySelectorAll('[data-field]').forEach(field => {{
+      const value = details[field.dataset.field] || '';
+      field.textContent = value;
+      field.hidden = !value;
+    }});
+    active = item;
+    item.setAttribute('aria-describedby', info.id);
+    info.hidden = false;
+    info.scrollTop = 0;
+    position();
+  }}
+  function closeSoon() {{
+    clearTimeout(openTimer);
+    clearTimeout(closeTimer);
+    closeTimer = setTimeout(hide, 180);
+  }}
+  guide.addEventListener('pointerover', event => {{
+    if (event.pointerType !== 'mouse') return;
+    const item = programme(event.target);
+    if (!item || item.contains(event.relatedTarget)) return;
+    clearTimeout(openTimer);
+    clearTimeout(closeTimer);
+    if (active !== item) openTimer = setTimeout(() => show(item), 160);
+  }});
+  guide.addEventListener('pointerout', event => {{
+    if (event.pointerType !== 'mouse') return;
+    const item = programme(event.target);
+    if (item && !item.contains(event.relatedTarget) && !info.contains(event.relatedTarget)) closeSoon();
+  }});
+  guide.addEventListener('focusin', event => {{
+    const item = programme(event.target);
+    if (item && item.matches(':focus-visible')) show(item);
+  }});
+  guide.addEventListener('focusout', closeSoon);
+  info.addEventListener('pointerenter', () => {{ clearTimeout(openTimer); clearTimeout(closeTimer); }});
+  info.addEventListener('pointerleave', closeSoon);
+  document.addEventListener('click', event => {{
+    const item = programme(event.target);
+    if (item) show(item);
+    else if (info.contains(event.target)) clearTimeout(closeTimer);
+    else hide();
+  }});
+  document.addEventListener('keydown', event => {{
+    if (event.key === 'Escape') hide();
+    else if ((event.key === 'Enter' || event.key === ' ') && programme(event.target)) {{
+      event.preventDefault(); show(programme(event.target));
+    }}
+  }});
+  document.addEventListener('scroll', event => {{ if (!info.contains(event.target)) hide(); }}, true);
+  window.addEventListener('resize', hide);
+  document.getElementById('filter').addEventListener('input', event => {{
+    hide();
+    const query = event.target.value.trim().toLocaleLowerCase('es');
+    document.querySelectorAll('.channel').forEach(row => {{
+      row.hidden = Boolean(query && !row.dataset.search.toLocaleLowerCase('es').includes(query));
+    }});
+  }});
+}})();
+</script>
 </body></html>"""
 
 
