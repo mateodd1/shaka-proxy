@@ -42,7 +42,7 @@ class StatusPageTests(unittest.TestCase):
         channel = snapshot['live'][0]
         self.assertEqual(channel['viewers'], 2)
         self.assertEqual(len(channel['clients']), 2)
-        self.assertEqual(channel['encryption'], 'CENC (AES-CTR)')
+        self.assertEqual(channel['encryption'], 'DRM')
         self.assertEqual(
             [(client['ip'], client['ua'], client['connected']) for client in channel['clients']],
             [('192.0.2.10', 'VLC iOS', '1m 05s'), ('192.0.2.11', 'TiviMate', '5s')],
@@ -60,7 +60,7 @@ class StatusPageTests(unittest.TestCase):
         self.assertIn("client.ip", page)
         self.assertIn("element('ul', 'client-list')", page)
         self.assertIn("element('li', 'client')", page)
-        self.assertIn("element('div', 'encryption', ch.encryption)", page)
+        self.assertIn("name.append(element('div', 'encryption', ch.encryption))", page)
         self.assertNotIn("grid-template-columns: repeat(auto-fit", page)
         initial = page.split('<script id="initial-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         data = json.loads(initial)

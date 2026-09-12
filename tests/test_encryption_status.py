@@ -33,13 +33,13 @@ class EncryptionStatusTests(unittest.TestCase):
         video, _ = proxy.select_tracks(manifest('cenc'), 1080, {'1' * 32: '2' * 32})
         self.assertEqual(video.protection_scheme, 'cenc')
         session = SimpleNamespace(video=video, audios=[], ch=SimpleNamespace(keys={'1': '2'}))
-        self.assertEqual(proxy.session_encryption(session), 'CENC (AES-CTR) · ClearKey')
+        self.assertEqual(proxy.session_encryption(session), 'DRM · ClearKey')
 
     def test_representation_level_cbcs_is_detected(self):
         video, _ = proxy.select_tracks(manifest('cbcs', representation_level=True), 1080)
         self.assertEqual(video.protection_scheme, 'cbcs')
         session = SimpleNamespace(video=video, audios=[], ch=SimpleNamespace(keys={}))
-        self.assertEqual(proxy.session_encryption(session), 'CBCS (AES-CBC)')
+        self.assertEqual(proxy.session_encryption(session), 'DRM')
 
     def test_unencrypted_or_not_yet_inspected_session_has_no_label(self):
         clear_video, _ = proxy.select_tracks(manifest(), 1080)
@@ -52,7 +52,7 @@ class EncryptionStatusTests(unittest.TestCase):
     def test_unknown_mp4_scheme_is_reported_without_guessing_cipher(self):
         video, _ = proxy.select_tracks(manifest('future-scheme'), 1080)
         session = SimpleNamespace(video=video, audios=[], ch=SimpleNamespace(keys={}))
-        self.assertEqual(proxy.session_encryption(session), 'FUTURE-SCHEME')
+        self.assertEqual(proxy.session_encryption(session), 'DRM')
 
 
 if __name__ == '__main__':

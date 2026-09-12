@@ -1968,16 +1968,9 @@ def session_encryption(sess) -> Optional[str]:
             schemes.append(scheme)
     if not schemes:
         return None
-    labels = {
-        "cenc": "CENC (AES-CTR)",
-        "cens": "CENS (AES-CTR)",
-        "cbc1": "CBC1 (AES-CBC)",
-        "cbcs": "CBCS (AES-CBC)",
-    }
-    result = " / ".join(labels.get(scheme, scheme.upper()) for scheme in schemes)
     if sess.ch.keys:
-        result += " · ClearKey"
-    return result
+        return "DRM · ClearKey"
+    return "DRM"
 
 
 def session_snapshot(state: AppState) -> dict:
@@ -2095,11 +2088,12 @@ def render_status_page(data: dict) -> str:
   .muted { color: var(--muted); }
   .channel { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .channel strong { overflow-wrap: anywhere; }
-  .channel-info { min-width: 0; }
+  .channel-info { min-width: 0; flex: 1; }
   .programme-title { margin-top: 3px; color: #d8dde5; font-size: .8rem; overflow-wrap: anywhere; }
   .programme-time { color: var(--muted); font-size: .7rem; font-variant-numeric: tabular-nums; }
   .encryption {
-    display: inline-block; margin-top: 5px; padding: 2px 7px; border: 1px solid #765d2b;
+    display: inline-block; flex: none; align-self: center; margin-left: auto; padding: 2px 7px;
+    border: 1px solid #765d2b; white-space: nowrap;
     border-radius: 999px; background: #2b2415; color: var(--amber); font-size: .66rem;
     font-weight: 650; letter-spacing: .02em;
   }
@@ -2259,8 +2253,8 @@ def render_status_page(data: dict) -> str:
       info.append(element('div', 'programme-title', ch.programme.title));
       info.append(element('div', 'programme-time', ch.programme.time));
     }
-    if (ch.encryption) info.append(element('div', 'encryption', ch.encryption));
     name.append(info);
+    if (ch.encryption) name.append(element('div', 'encryption', ch.encryption));
     nameCell.append(name);
     summary.append(nameCell);
     summary.append(cell('Activo', 'mono', duration(ch.active_s)));

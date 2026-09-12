@@ -771,7 +771,7 @@ Entre los datos disponibles están:
 
 La programación se actualiza sin recargar la página. La guía se carga en segundo plano y se reutiliza entre consultas; si no hay un programa vigente en la EPG, se muestra solo el nombre del canal. No se analiza el vídeo: la información corresponde a la programación de ese canal en la guía.
 
-Cuando el MPD declara cifrado, el estado muestra el esquema real de las pistas seleccionadas —por ejemplo, `CENC (AES-CTR) · ClearKey`— sin exponer identificadores ni claves. Si el canal está en claro o todavía no se ha inspeccionado su MPD, no aparece ninguna etiqueta de cifrado.
+Cuando el MPD declara cifrado, el estado muestra `DRM · ClearKey` si el proxy utiliza claves ClearKey, sin exponer claves ni identificadores. La etiqueta aparece centrada a la derecha del nombre y del programa, sin aumentar la altura de la fila. Si el canal está en claro o todavía no se ha inspeccionado su MPD, no aparece ninguna etiqueta de cifrado.
 
 ---
 

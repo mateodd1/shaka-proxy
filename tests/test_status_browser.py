@@ -26,7 +26,7 @@ class StatusBrowserTests(unittest.TestCase):
                 'idle_s': 1, 'viewers': 1, 'quality': '1080p50', 'cached': 8,
                 'clients': [{'ip': '192.0.2.10', 'ua': 'VLC', 'connected': '1m 30s'}],
                 'programme': {'title': 'Clasificación de Fórmula 1', 'time': '15:00–16:00'},
-                'encryption': 'CENC (AES-CTR) · ClearKey',
+                'encryption': 'DRM · ClearKey',
             }],
         }
         self.errors = []
@@ -55,7 +55,18 @@ class StatusBrowserTests(unittest.TestCase):
         expect(info.locator('strong')).to_have_text('Canal de prueba')
         expect(info.locator('.programme-title')).to_have_text('Clasificación de Fórmula 1')
         expect(info.locator('.programme-time')).to_have_text('15:00–16:00')
-        expect(info.locator('.encryption')).to_have_text('CENC (AES-CTR) · ClearKey')
+        badge = self.page.locator('.channel > .encryption')
+        expect(badge).to_have_text('DRM · ClearKey')
+        channel_box = self.page.locator('.channel').bounding_box()
+        info_box = info.bounding_box()
+        badge_box = badge.bounding_box()
+        self.assertGreaterEqual(badge_box['x'], info_box['x'] + info_box['width'])
+        self.assertLess(abs((badge_box['y'] + badge_box['height'] / 2) -
+                            (channel_box['y'] + channel_box['height'] / 2)), 1)
+        height_with_drm = self.page.locator('.channel-summary').bounding_box()['height']
+        badge.evaluate('(node) => node.remove()')
+        self.assertAlmostEqual(self.page.locator('.channel-summary').bounding_box()['height'],
+                               height_with_drm, delta=.1)
         self.assertGreater(info.locator('.programme-title').bounding_box()['y'],
                            info.locator('strong').bounding_box()['y'])
         title = '</script><img src=x onerror="window.injected=true">'
@@ -82,7 +93,7 @@ class StatusBrowserTests(unittest.TestCase):
         from playwright.sync_api import expect
         self.data['live'][0]['encryption'] = None
         self.page.clock.run_for(4100)
-        expect(self.page.locator('.encryption')).to_have_count(0)
+        expect(self.page.locator('.channel > .encryption')).to_have_count(0)
         expect(self.page.locator('.channel-info strong')).to_have_text('Canal de prueba')
 
     def test_missing_programme_keeps_channel_and_clients_visible(self):
