@@ -332,6 +332,22 @@ def adaptation_kid(aset: ET.Element) -> Optional[str]:
     return None
 
 
+def protection_scheme(aset: ET.Element, rep: ET.Element) -> str:
+    """Return the ISO Common Encryption scheme declared for a selected track."""
+    encrypted = False
+    for parent in (rep, aset):
+        for cp in parent.findall(qtag("ContentProtection")):
+            scheme_id = (cp.get("schemeIdUri") or "").strip().lower()
+            value = (cp.get("value") or "").strip().lower()
+            if scheme_id == "urn:mpeg:dash:mp4protection:2011":
+                encrypted = True
+                if value:
+                    return value[:32]
+            if cp.get(cenc_attr("default_KID")) or cp.get("default_KID"):
+                encrypted = True
+    return "cenc" if encrypted else ""
+
+
 def is_iframe_set(aset: ET.Element) -> bool:
     if aset.get("maxPlayoutRate"):
         return True
@@ -380,6 +396,7 @@ class DashTrack:
     bandwidth: int = 0
     fps: float = 0.0
     lang: str = ""
+    protection_scheme: str = ""
 
 
 def parse_framerate(raw: Optional[str]) -> float:
@@ -465,6 +482,7 @@ def select_tracks(
             bandwidth=int(rep.get("bandwidth") or 0),
             fps=parse_framerate(rep.get("frameRate") or aset.get("frameRate") or aset.get("maxFrameRate")),
             lang=aset.get("lang") or "",
+            protection_scheme=protection_scheme(aset, rep),
         )
 
     def best_rep(aset: ET.Element, cap: int) -> Optional[ET.Element]:
@@ -1942,6 +1960,26 @@ def fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+def session_encryption(sess) -> Optional[str]:
+    schemes = []
+    for track in [sess.video] + list(sess.audios):
+        scheme = (getattr(track, "protection_scheme", "") or "").lower()
+        if scheme and scheme not in schemes:
+            schemes.append(scheme)
+    if not schemes:
+        return None
+    labels = {
+        "cenc": "CENC (AES-CTR)",
+        "cens": "CENS (AES-CTR)",
+        "cbc1": "CBC1 (AES-CBC)",
+        "cbcs": "CBCS (AES-CBC)",
+    }
+    result = " / ".join(labels.get(scheme, scheme.upper()) for scheme in schemes)
+    if sess.ch.keys:
+        result += " · ClearKey"
+    return result
+
+
 def session_snapshot(state: AppState) -> dict:
     now = time.monotonic()
     epg_now = datetime.now(timezone.utc)
@@ -1967,6 +2005,7 @@ def session_snapshot(state: AppState) -> dict:
                     "title": current["title"],
                     "time": f"{fmt_epg_time(current['start'])}–{fmt_epg_time(current['stop'])}",
                 } if current else None,
+                "encryption": session_encryption(sess),
                 "active": fmt_duration(now - sess.started_mono),
                 "active_s": int(now - sess.started_mono),
                 "idle": fmt_duration(now - sess.last_access),
@@ -2059,6 +2098,11 @@ def render_status_page(data: dict) -> str:
   .channel-info { min-width: 0; }
   .programme-title { margin-top: 3px; color: #d8dde5; font-size: .8rem; overflow-wrap: anywhere; }
   .programme-time { color: var(--muted); font-size: .7rem; font-variant-numeric: tabular-nums; }
+  .encryption {
+    display: inline-block; margin-top: 5px; padding: 2px 7px; border: 1px solid #765d2b;
+    border-radius: 999px; background: #2b2415; color: var(--amber); font-size: .66rem;
+    font-weight: 650; letter-spacing: .02em;
+  }
   .logo, .logo-ph { width: 38px; height: 38px; flex: none; object-fit: contain; }
   .logo-ph { display: grid; place-items: center; border-radius: 9px; background: #222a36; color: var(--muted); font-size: .7rem; }
   .client-count-wrap { display: inline-flex; align-items: center; gap: 8px; }
@@ -2215,6 +2259,7 @@ def render_status_page(data: dict) -> str:
       info.append(element('div', 'programme-title', ch.programme.title));
       info.append(element('div', 'programme-time', ch.programme.time));
     }
+    if (ch.encryption) info.append(element('div', 'encryption', ch.encryption));
     name.append(info);
     nameCell.append(name);
     summary.append(nameCell);

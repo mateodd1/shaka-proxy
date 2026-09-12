@@ -26,6 +26,7 @@ class StatusBrowserTests(unittest.TestCase):
                 'idle_s': 1, 'viewers': 1, 'quality': '1080p50', 'cached': 8,
                 'clients': [{'ip': '192.0.2.10', 'ua': 'VLC', 'connected': '1m 30s'}],
                 'programme': {'title': 'Clasificación de Fórmula 1', 'time': '15:00–16:00'},
+                'encryption': 'CENC (AES-CTR) · ClearKey',
             }],
         }
         self.errors = []
@@ -54,6 +55,7 @@ class StatusBrowserTests(unittest.TestCase):
         expect(info.locator('strong')).to_have_text('Canal de prueba')
         expect(info.locator('.programme-title')).to_have_text('Clasificación de Fórmula 1')
         expect(info.locator('.programme-time')).to_have_text('15:00–16:00')
+        expect(info.locator('.encryption')).to_have_text('CENC (AES-CTR) · ClearKey')
         self.assertGreater(info.locator('.programme-title').bounding_box()['y'],
                            info.locator('strong').bounding_box()['y'])
         title = '</script><img src=x onerror="window.injected=true">'
@@ -75,6 +77,13 @@ class StatusBrowserTests(unittest.TestCase):
         expect(self.page.locator('.client-details')).to_be_visible()
         expect(self.page.locator('.client-count')).to_have_text('1')
         self.assertEqual(self.documents, 1)
+
+    def test_encryption_badge_is_hidden_when_stream_is_clear_or_unknown(self):
+        from playwright.sync_api import expect
+        self.data['live'][0]['encryption'] = None
+        self.page.clock.run_for(4100)
+        expect(self.page.locator('.encryption')).to_have_count(0)
+        expect(self.page.locator('.channel-info strong')).to_have_text('Canal de prueba')
 
     def test_missing_programme_keeps_channel_and_clients_visible(self):
         from playwright.sync_api import expect

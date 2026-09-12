@@ -762,6 +762,7 @@ Entre los datos disponibles están:
 - tiempo conectado;
 - segmentos en caché;
 - resolución y framerate seleccionados;
+- esquema de cifrado detectado en las pistas seleccionadas y uso de ClearKey;
 - estado del productor;
 - estado del token;
 - tiempo de actividad/inactividad.
@@ -769,6 +770,8 @@ Entre los datos disponibles están:
 `/status.json` devuelve la misma clase de información en un formato más cómodo para scripts o monitorización.
 
 La programación se actualiza sin recargar la página. La guía se carga en segundo plano y se reutiliza entre consultas; si no hay un programa vigente en la EPG, se muestra solo el nombre del canal. No se analiza el vídeo: la información corresponde a la programación de ese canal en la guía.
+
+Cuando el MPD declara cifrado, el estado muestra el esquema real de las pistas seleccionadas —por ejemplo, `CENC (AES-CTR) · ClearKey`— sin exponer identificadores ni claves. Si el canal está en claro o todavía no se ha inspeccionado su MPD, no aparece ninguna etiqueta de cifrado.
 
 ---
 
