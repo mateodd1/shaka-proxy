@@ -41,13 +41,13 @@ class EncryptionStatusTests(unittest.TestCase):
         session = SimpleNamespace(video=video, audios=[], ch=SimpleNamespace(keys={}))
         self.assertEqual(proxy.session_encryption(session), 'DRM')
 
-    def test_unencrypted_or_not_yet_inspected_session_has_no_label(self):
+    def test_unencrypted_track_is_clear_but_uninspected_session_has_no_label(self):
         clear_video, _ = proxy.select_tracks(manifest(), 1080)
-        for video in (clear_video, None):
+        for video, expected in ((clear_video, 'CLEAR'), (None, None)):
             with self.subTest(video=video):
                 session = SimpleNamespace(video=video, audios=[],
                                           ch=SimpleNamespace(keys={'configured': 'key'}))
-                self.assertIsNone(proxy.session_encryption(session))
+                self.assertEqual(proxy.session_encryption(session), expected)
 
     def test_unknown_mp4_scheme_is_reported_without_guessing_cipher(self):
         video, _ = proxy.select_tracks(manifest('future-scheme'), 1080)

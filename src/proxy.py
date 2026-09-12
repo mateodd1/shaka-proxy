@@ -1961,13 +1961,16 @@ def fmt_duration(seconds: float) -> str:
 
 
 def session_encryption(sess) -> Optional[str]:
+    tracks = [track for track in [sess.video] + list(sess.audios) if track is not None]
+    if not tracks:
+        return None
     schemes = []
-    for track in [sess.video] + list(sess.audios):
+    for track in tracks:
         scheme = (getattr(track, "protection_scheme", "") or "").lower()
         if scheme and scheme not in schemes:
             schemes.append(scheme)
     if not schemes:
-        return None
+        return "CLEAR"
     if sess.ch.keys:
         return "DRM · ClearKey"
     return "DRM"
