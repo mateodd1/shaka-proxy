@@ -192,7 +192,8 @@ class ProducerTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_shutdown_closes_idle_stream_without_hanging(self):
         self.sess.start_producer = Mock()
         self.sess.ready_entries = Mock(return_value=[])
-        state = SimpleNamespace(sessions={'test': self.sess}, get_session=AsyncMock(return_value=self.sess))
+        state = SimpleNamespace(sessions={'test': self.sess}, get_session=AsyncMock(return_value=self.sess),
+                                epg=SimpleNamespace(close=AsyncMock()))
         app = web.Application()
         app['state'] = state
         app['reaper'] = asyncio.create_task(asyncio.Event().wait())

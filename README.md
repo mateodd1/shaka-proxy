@@ -755,6 +755,7 @@ Entre los datos disponibles están:
 
 - canales cargados;
 - sesiones activas;
+- programa que se está emitiendo en cada canal y su horario, según la EPG (hora de Madrid);
 - espectadores;
 - clientes conectados;
 - IP y User-Agent;
@@ -766,6 +767,8 @@ Entre los datos disponibles están:
 - tiempo de actividad/inactividad.
 
 `/status.json` devuelve la misma clase de información en un formato más cómodo para scripts o monitorización.
+
+La programación se actualiza sin recargar la página. La guía se carga en segundo plano y se reutiliza entre consultas; si no hay un programa vigente en la EPG, se muestra solo el nombre del canal. No se analiza el vídeo: la información corresponde a la programación de ese canal en la guía.
 
 ---
 

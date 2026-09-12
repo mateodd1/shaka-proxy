@@ -664,6 +664,31 @@ class EPG:
         self.programmes: dict[str, list[dict]] = {}
         self.error = ""
         self.lock = asyncio.Lock()
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._retry_after = 0.0
+
+    def request_refresh(self) -> None:
+        """Refresh stale guide data without making status requests wait for XMLTV."""
+        now = time.monotonic()
+        ttl = float(self.cfg.get("epg_ttl_seconds", 900))
+        if self.programmes and now - self.updated <= ttl:
+            return
+        if now < self._retry_after or (self._refresh_task and not self._refresh_task.done()):
+            return
+        self._refresh_task = asyncio.create_task(self._refresh_background())
+
+    async def _refresh_background(self) -> None:
+        try:
+            await self.snapshot()
+        finally:
+            # A failed source must not be retried on every four-second status poll.
+            self._retry_after = time.monotonic() + 60
+
+    async def close(self) -> None:
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            await asyncio.gather(self._refresh_task, return_exceptions=True)
+            self._refresh_task = None
 
     async def snapshot(self) -> dict:
         ttl = float(self.cfg.get("epg_ttl_seconds", 900))
@@ -1919,8 +1944,11 @@ def fmt_duration(seconds: float) -> str:
 
 def session_snapshot(state: AppState) -> dict:
     now = time.monotonic()
+    epg_now = datetime.now(timezone.utc)
     live = []
     for slug, sess in sorted(state.sessions.items(), key=lambda kv: -kv[1].started_mono):
+        current = next((p for p in state.epg.programmes.get(slug, [])
+                        if p["start"] <= epg_now < p["stop"]), None)
         clients = []
         for c in sess.clients.values():
             clients.append(
@@ -1935,6 +1963,10 @@ def session_snapshot(state: AppState) -> dict:
                 "slug": slug,
                 "name": sess.ch.name,
                 "logo": sess.ch.logo,
+                "programme": {
+                    "title": current["title"],
+                    "time": f"{fmt_epg_time(current['start'])}–{fmt_epg_time(current['stop'])}",
+                } if current else None,
                 "active": fmt_duration(now - sess.started_mono),
                 "active_s": int(now - sess.started_mono),
                 "idle": fmt_duration(now - sess.last_access),
@@ -2024,6 +2056,9 @@ def render_status_page(data: dict) -> str:
   .muted { color: var(--muted); }
   .channel { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .channel strong { overflow-wrap: anywhere; }
+  .channel-info { min-width: 0; }
+  .programme-title { margin-top: 3px; color: #d8dde5; font-size: .8rem; overflow-wrap: anywhere; }
+  .programme-time { color: var(--muted); font-size: .7rem; font-variant-numeric: tabular-nums; }
   .logo, .logo-ph { width: 38px; height: 38px; flex: none; object-fit: contain; }
   .logo-ph { display: grid; place-items: center; border-radius: 9px; background: #222a36; color: var(--muted); font-size: .7rem; }
   .client-count-wrap { display: inline-flex; align-items: center; gap: 8px; }
@@ -2174,7 +2209,13 @@ def render_status_page(data: dict) -> str:
     } else {
       name.append(element('span', 'logo-ph', 'TV'));
     }
-    name.append(element('strong', '', ch.name || ch.slug || 'Canal'));
+    const info = element('div', 'channel-info');
+    info.append(element('strong', '', ch.name || ch.slug || 'Canal'));
+    if (ch.programme && ch.programme.title) {
+      info.append(element('div', 'programme-title', ch.programme.title));
+      info.append(element('div', 'programme-time', ch.programme.time));
+    }
+    name.append(info);
     nameCell.append(name);
     summary.append(nameCell);
     summary.append(cell('Activo', 'mono', duration(ch.active_s)));
@@ -2284,6 +2325,8 @@ def render_status_page(data: dict) -> str:
 async def handle_status(request: web.Request) -> web.Response:
     state: AppState = request.app["state"]
     state.playlist.maybe_reload(state.cfg["default_ua"], state.cfg["referer"])
+    if state.sessions:
+        state.epg.request_refresh()
     data = session_snapshot(state)
     return web.Response(text=render_status_page(data), content_type="text/html", charset="utf-8")
 
@@ -2521,6 +2564,8 @@ async def handle_epg(request: web.Request) -> web.Response:
 async def handle_status_json(request: web.Request) -> web.Response:
     state: AppState = request.app["state"]
     state.playlist.maybe_reload(state.cfg["default_ua"], state.cfg["referer"])
+    if state.sessions:
+        state.epg.request_refresh()
     return web.json_response(session_snapshot(state))
 
 
@@ -2541,6 +2586,7 @@ async def on_shutdown(app: web.Application) -> None:
     state: AppState = app["state"]
     app["reaper"].cancel()
     await asyncio.gather(app["reaper"], return_exceptions=True)
+    await state.epg.close()
     await asyncio.gather(*(sess.stop() for sess in list(state.sessions.values())))
 
 
