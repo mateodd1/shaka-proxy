@@ -44,6 +44,7 @@ http://127.0.0.1:8090/live/3e7c7e64b3c366ad87d1826a/index.m3u8
 Actualmente el proxy incluye, entre otras cosas:
 
 - DASH en directo a MPEG-TS.
+- Resolución de `BaseURL` en los niveles MPD, Period, AdaptationSet y Representation.
 - Salida HLS.
 - Streams CENC/ClearKey mediante Shaka Packager.
 - Streams DASH sin cifrar.

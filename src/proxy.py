@@ -429,6 +429,21 @@ def _rep_rank(rep: ET.Element) -> tuple[int, int]:
     return (int(rep.get("height") or 0), int(rep.get("bandwidth") or 0))
 
 
+def inherited_base_url(element: ET.Element, parents: dict[ET.Element, ET.Element]) -> str:
+    """Resolve the first BaseURL declared at each DASH hierarchy level."""
+    hierarchy = []
+    current: Optional[ET.Element] = element
+    while current is not None:
+        hierarchy.append(current)
+        current = parents.get(current)
+    base = ""
+    for node in reversed(hierarchy):
+        base_element = node.find(qtag("BaseURL"))
+        if base_element is not None and (base_element.text or "").strip():
+            base = urljoin(base, (base_element.text or "").strip())
+    return base
+
+
 def iso639(lang: str) -> str:
     code = (lang or "").strip().lower().replace("_", "-").split("-")[0]
     code = {
@@ -453,6 +468,7 @@ def select_tracks(
     actual height then bandwidth instead. max_height <= 0 means no cap.
     """
     root = ET.fromstring(mpd)
+    parents = {child: parent for parent in root.iter() for child in parent}
     video_sets, audio_sets = [], []
     for aset in root.iter(qtag("AdaptationSet")):
         if is_iframe_set(aset):
@@ -469,12 +485,16 @@ def select_tracks(
         if stempl is None:
             return None
         entries, timescale = expand_timeline(stempl)
+        base = inherited_base_url(rep, parents)
         return DashTrack(
             kind=kind,
             rep_id=rep.get("id") or "",
             timescale=timescale,
-            init_rel=fill_template(stempl.get("initialization") or "", rep.get("id") or ""),
-            media_tmpl=stempl.get("media") or "",
+            init_rel=urljoin(
+                base,
+                fill_template(stempl.get("initialization") or "", rep.get("id") or ""),
+            ),
+            media_tmpl=urljoin(base, stempl.get("media") or ""),
             kid=adaptation_kid(aset),
             entries=entries,
             codecs=rep.get("codecs") or "",
