@@ -65,6 +65,12 @@ class ProducerTests(unittest.IsolatedAsyncioTestCase):
         self.entries.extend([(1050, 150), (1200, 150)])
         self.assertEqual(self.sess.next_pending(self.entries), (1050, 150))
 
+    def test_short_segments_start_far_enough_back_for_the_join_buffer(self):
+        self.sess.video = SimpleNamespace(entries=[], timescale=1000)
+        chunks = [(n * 2000, 2000) for n in range(1, 7)]
+        self.assertEqual(self.sess.next_pending(chunks), (8000, 2000))
+        self.assertEqual(self.sess._join_t(chunks), 8000)
+
     def test_failed_segment_is_retried_before_newer_edge(self):
         self.sess._next_t = 900
         self.sess._fail_t[900] = 1

@@ -1347,10 +1347,11 @@ class ChannelSession:
                 )
 
     def _refresh_interval(self) -> float:
-        """Smooth live manifests carry the whole DVR window (~170 KB for 2 h) and
-        CDNs cache them for one chunk, so poll once per chunk instead of every second."""
+        """Smooth live manifests carry the whole DVR window (~170 KB for 2 h):
+        poll twice per chunk. Slower polling adds its delay to the CDN's own
+        ~1.6 s publication jitter, and late chunks stall players."""
         if self.ch.is_smooth and self.video is not None and self.video.entries:
-            return min(4.0, max(1.0, self.video.entries[-1][1] / max(self.video.timescale, 1)))
+            return min(2.0, max(1.0, self.video.entries[-1][1] / max(self.video.timescale, 1) / 2))
         return 1.0
 
     def _audio_entries(self, video: DashTrack, t: int, duration: int, audio: DashTrack) -> list[tuple[int, int]]:
@@ -1700,7 +1701,7 @@ class ChannelSession:
                     await asyncio.sleep(1.0)
                     continue
                 if self.ts_origin_t is None:
-                    self.ts_origin_t = closed[-1][0]
+                    self.ts_origin_t = self._join_t(closed)
                 edge_t = closed[-1][0]
                 if edge_t != self._edge_seen:
                     self._edge_seen = edge_t
@@ -1715,6 +1716,7 @@ class ChannelSession:
                     self._edge_since = time.monotonic()
                 pending = self.next_pending(closed)
                 want_t = pending[0] if pending else None
+                produced = False
                 if want_t is not None:
                     remux_timeout = max(12.0, float(self.cfg.get("remux_timeout", 20)))
                     try:
@@ -1723,6 +1725,7 @@ class ChannelSession:
                         self._last_mux = time.monotonic()
                         self._fail_t.pop(want_t, None)
                         self._next_t = want_t + pending[1]
+                        produced = True
                     except Exception as exc:
                         log.warning("producer remux %s t=%s: %s %s", self.ch.slug, want_t, type(exc).__name__, exc)
                         self._fail_t[want_t] = self._fail_t.get(want_t, 0) + 1
@@ -1732,6 +1735,8 @@ class ChannelSession:
                             self._skip_t.add(want_t)
                             self._next_t = want_t + pending[1]
                 self._prune_cache()
+                if produced:
+                    continue  # more ready segments may be pending; no idle pause
             except asyncio.CancelledError:
                 raise
             except web.HTTPException as exc:
@@ -1749,12 +1754,17 @@ class ChannelSession:
                 log.exception("producer %s", self.ch.slug)
             await asyncio.sleep(0.35)
 
+    def _join_t(self, closed: list[tuple[int, int]]) -> int:
+        """Start far enough back that a new client gets JOIN_BUFFER_S of media."""
+        timescale = self.video.timescale if self.video is not None else 1
+        return join_point(closed, timescale)[0]
+
     def next_pending(self, closed: list[tuple[int, int]]) -> Optional[tuple[int, int]]:
-        """Join at the edge once, then recover available segments in order."""
+        """Join near the edge once, then recover available segments in order."""
         if not closed:
             return None
         if self._next_t is None:
-            self._next_t = closed[-1][0]
+            self._next_t = self._join_t(closed)
         if self._next_t < closed[0][0]:
             log.warning("segments expired %s expected=%s available=%s", self.ch.slug, self._next_t, closed[0][0])
             self._next_t = closed[0][0]
@@ -1917,6 +1927,25 @@ class TSContinuity:
         return bytes(output)
 
 
+# Seconds of ready media a new client starts with, and the most it may run
+# ahead of real time. A 6 s DASH segment covers the join on its own; 2 s Smooth
+# chunks need three, since the CDN publishes them with up to ~3 s of jitter.
+JOIN_BUFFER_S = 6.0
+CLIENT_LEAD_S = 10.0
+
+
+def join_point(entries: list[tuple[int, int]], timescale: int) -> tuple[int, int]:
+    """Newest ready segment from which the client gets JOIN_BUFFER_S of media."""
+    acc = 0.0
+    start = entries[-1]
+    for t, d in reversed(entries):
+        start = (t, d)
+        acc += d / max(timescale, 1)
+        if acc >= JOIN_BUFFER_S:
+            break
+    return start
+
+
 async def write_ts(resp: web.StreamResponse, data: bytes, duration: float = 0.0, continuity=None) -> None:
     if continuity is not None:
         data = continuity.rewrite(data)
@@ -1978,6 +2007,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     last_t: Optional[int] = None
     join_t: Optional[int] = None
     join_at = 0.0
+    clock_start, base_t = 0.0, 0
     continuity = TSContinuity()
     expected_t: Optional[int] = None
     sess.viewers += 1
@@ -2004,12 +2034,15 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                 log.warning("stream tracks changed %s; closing for reconnect", sess.ch.slug)
                 break
             entries = sess.ready_entries(pin=True)
+            timescale = max((sess.video.timescale if sess.video else 1), 1)
             if last_t is None:
-                # Pin the latest ready segment while a small startup margin
-                # builds. Chasing newer segments would discard that margin.
+                # Pin the join segment while a small startup margin builds.
+                # Chasing newer segments would discard that margin.
                 if entries and all(t != join_t for t, _d in entries):
-                    join_t, join_d = entries[-1]
-                    margin = min(3.0, join_d / max((sess.video.timescale if sess.video else 1), 1) / 2)
+                    join_t, join_d = join_point(entries, timescale)
+                    # Ready segments after the join point are already margin.
+                    backlog = sum(d for t, d in entries if t > join_t) / timescale
+                    margin = max(0.0, min(3.0, join_d / timescale / 2) - backlog)
                     join_at = min(started + 25.0, time.monotonic() + margin)
                 entries = ([entry for entry in entries if entry[0] == join_t]
                            if time.monotonic() >= join_at else [])
@@ -2024,10 +2057,19 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                     continue
                 if len(data) < 40000:
                     continue
-                dur = d / max((sess.video.timescale if sess.video else 1), 1)
+                dur = d / timescale
                 if expected_t is not None and t != expected_t:
                     log.warning("stream gap %s expected=%s received=%s", sess.ch.slug, expected_t, t)
-                await write_ts(resp, data, 0.0 if last_t is None else dur, continuity=continuity)
+                if last_t is None:
+                    clock_start, base_t = time.monotonic(), t
+                # Pace against the stream clock, not per segment: a late segment
+                # is sent at once to restore the player's buffer instead of
+                # losing that margin for good. Only media more than `lead`
+                # seconds ahead of real time is spread out.
+                lead = max(CLIENT_LEAD_S, 2 * dur)
+                ahead_at_end = (t + d - base_t) / timescale - (time.monotonic() - clock_start)
+                pace = ahead_at_end - lead
+                await write_ts(resp, data, pace / 0.98 if pace > 0 else 0.0, continuity=continuity)
                 last_t = t
                 expected_t = t + d
                 last_output = time.monotonic()

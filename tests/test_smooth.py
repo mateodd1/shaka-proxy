@@ -210,14 +210,14 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
             await session.remux(session.video.entries[0][0])
         self.assertIn('no key', ctx.exception.text)
 
-    async def test_refresh_polls_once_per_chunk_and_skips_unchanged_manifest(self):
+    async def test_refresh_polls_twice_per_chunk_and_skips_unchanged_manifest(self):
         session = self.make_session()
         del session.refresh  # use the real method
         session.video = None
         session.origin.fetch_mpd = AsyncMock(return_value=self.manifest)
         with patch.object(proxy, 'select_smooth_tracks', wraps=proxy.select_smooth_tracks) as select:
             await session.refresh()
-            self.assertAlmostEqual(session._refresh_interval(), 2.0, delta=0.1)
+            self.assertAlmostEqual(session._refresh_interval(), 1.0, delta=0.1)
             await session.refresh()  # inside the interval: no request
             self.assertEqual(session.origin.fetch_mpd.await_count, 1)
             session.mpd_at = 0

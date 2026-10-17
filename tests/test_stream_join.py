@@ -80,8 +80,40 @@ class StreamJoinTests(unittest.IsolatedAsyncioTestCase):
                 self.sess.stopped = True
 
         await self.run_stream(advance)
-        self.assertEqual(self.sent, [(6, 0.0), (7, 6.0), (8, 6.0)])
+        # Segment 7 fits in the client lead (2 x 6 s) and goes out at once;
+        # segment 8 would run 18 s ahead, so its excess is spread out.
+        self.assertEqual([n for n, _ in self.sent], [6, 7, 8])
+        self.assertEqual(self.sent[:2], [(6, 0.0), (7, 0.0)])
+        self.assertAlmostEqual(self.sent[2][1] * 0.98, 6.0, places=6)
         self.assertEqual(self.sent_at, [self.sent_at[0]] * 3)  # No second startup wait.
+
+    async def test_short_segments_join_with_six_seconds_of_media_and_no_wait(self):
+        self.entries[:] = [(n * 2000, 2000) for n in range(1, 7)]
+        for n in range(1, 7):
+            (self.sess.hls_dir / f"seg_{n * 2000}.ts").write_bytes(bytes([n]) * 41360)
+        def advance():
+            if len(self.sent) == 3:
+                self.sess.stopped = True
+        await self.run_stream(advance)
+        self.assertEqual(self.sent, [(4, 0.0), (5, 0.0), (6, 0.0)])
+        self.assertEqual(self.sent_at, [0.0, 0.0, 0.0])
+
+    async def test_late_segment_is_sent_at_once_to_restore_the_buffer(self):
+        self.entries[:] = [(n * 2000, 2000) for n in range(1, 7)]
+        for n in range(1, 8):
+            (self.sess.hls_dir / f"seg_{n * 2000}.ts").write_bytes(bytes([n]) * 41360)
+        def late_chunk():
+            # The chunk after the join shows up 3 s late (2 s was expected).
+            if self.clock >= 5 and self.entries[-1][0] < 14000:
+                self.entries.append((14000, 2000))
+        def advance():
+            if len(self.sent) == 3:
+                self.on_sleep = late_chunk
+            if len(self.sent) == 4:
+                self.sess.stopped = True
+        await self.run_stream(advance)
+        self.assertEqual([n for n, _ in self.sent], [4, 5, 6, 7])
+        self.assertEqual(self.sent[3][1], 0.0)  # no pacing while behind
 
     async def test_cold_channel_waits_then_joins_latest_ready(self):
         self.sess.ready_entries.side_effect = lambda **kw: list(self.entries) if self.clock else []
