@@ -17,6 +17,7 @@ from Crypto.Cipher import AES
 
 import proxy
 import smooth_streaming as smooth
+import test_subtitles as subtitles_test
 
 FFMPEG = shutil.which('ffmpeg') or '/usr/lib/jellyfin-ffmpeg/ffmpeg'
 FFPROBE = shutil.which('ffprobe') or '/usr/lib/jellyfin-ffmpeg/ffprobe'
@@ -95,7 +96,7 @@ class SmoothManifestTests(unittest.TestCase):
         self.assertEqual(video.media_tmpl, 'QualityLevels(2000000)/Fragments(video=$Time$)?token=abc')
         self.assertEqual(proxy.fill_template(video.media_tmpl, video.rep_id, 120),
                          'QualityLevels(2000000)/Fragments(video=120)?token=abc')
-        self.assertEqual([a.lang for a in audios], ['spa', 'eng'])  # Spanish first, text ignored
+        self.assertEqual([a.lang for a in audios], ['spa', 'eng'])  # Spanish first, text apart
         self.assertTrue(video.smooth and audios[0].smooth)
 
     def test_height_cap(self):
@@ -155,10 +156,12 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def make_session(self, keys=None, encrypt=False, manifest=None, ism=None):
+    def make_session(self, keys=None, encrypt=False, manifest=None, ism=None, text=None):
         ism = ism or self.ism
 
         async def fetch(ch, relative, **kwargs):
+            if text and 'Fragments(text=' in relative:
+                return text(int(relative.split('=')[1].split(')')[0]))
             data = (ism / relative.split('?')[0]).read_bytes()
             return encrypt_fragment(data, KEY) if encrypt and 'Fragments' in relative else data
         origin = SimpleNamespace(work_sem=asyncio.Semaphore(1), fetch_rel=fetch)
@@ -166,7 +169,7 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
         session = proxy.ChannelSession(
             SimpleNamespace(slug='smooth', keys=keys or {}, url='http://origin/Stream.ism/Manifest', is_smooth=True),
             {'hls_dir': hls, 'ffmpeg': FFMPEG}, origin)
-        session.video, session.audios = proxy.select_smooth_tracks(manifest or self.manifest, 1080)
+        session.video, session.audios = proxy.select_smooth_tracks(manifest or self.manifest, 1080, texts=session.texts)
         session.refresh = AsyncMock()
         session._prune_cache = Mock()
         return session
@@ -215,6 +218,52 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
         frags = list(self.still_ism.glob('QualityLevels(*)/Fragments(video=*)'))
         self.assertLess(max(p.stat().st_size for p in frags), 20000)  # below the old floor
         self.check_continuous(await self.probe(session), frames=100)
+
+    async def test_ttml_stream_becomes_dvb_subtitles_in_the_ts(self):
+        video_chunks = [line for line in self.manifest.decode().split('<StreamIndex')[1].splitlines() if line.startswith('<c ')]
+        text_index = ('<StreamIndex Type="text" Subtype="SUBT" Name="text" Language="spa" '
+                      'Url="QualityLevels({bitrate})/Fragments(text={start time})">'
+                      '<QualityLevel Index="0" Bitrate="1000" FourCC="TTML"/>' + ''.join(video_chunks) + '</StreamIndex>')
+        manifest = self.manifest.replace(b'</SmoothStreamingMedia>', text_index.encode() + b'</SmoothStreamingMedia>')
+
+        def text(t):  # one cue 0.5-1.5 s into each chunk, on the media timeline
+            start = t / 10_000_000
+            doc = subtitles_test.ttml((f'{start + .5:.3f}s', f'{start + 1.5:.3f}s', f'Cue {t}'))
+            return subtitles_test.fragment([(20_000_000, doc)])
+        session = self.make_session(manifest=manifest, text=text)
+        self.assertEqual([(s.kind, s.lang, s.codecs) for s in session.texts], [('text', 'spa', 'ttml')])
+        output = b''.join([(await session.remux(t)).read_bytes() for t, _d in session.video.entries[:2]])
+        result = await asyncio.to_thread(
+            subprocess.run, [FFPROBE, '-v', 'error', '-show_entries', 'stream=codec_type,codec_name:stream_tags=language'
+                             ':subtitle=pts,num_rects', '-of', 'json', 'pipe:0'],
+            input=output, capture_output=True, timeout=30)
+        data = json.loads(result.stdout)
+        self.assertEqual([(s['codec_type'], s.get('tags', {}).get('language')) for s in data['streams']],
+                         [('video', None), ('audio', 'und'), ('subtitle', 'spa')])
+        shown = [(round(int(f['pts']) / 1e6, 2), f['num_rects']) for f in data['frames'] if 'num_rects' in f]
+        # The TS clock starts at 1 s: clear, cue, clear for each 2 s segment.
+        self.assertEqual(shown, [(1.0, 0), (1.5, 1), (2.5, 0), (3.0, 0), (3.5, 1), (4.5, 0)])
+
+    async def test_eac3_audio_remuxes_without_a_dec3_box(self):
+        work = Path(self.tmp.name)
+        subprocess.run([FFMPEG, '-v', 'error', '-y', '-f', 'lavfi', '-i', 'sine=r=48000,aformat=channel_layouts=5.1',
+                        '-t', '3', '-c:a', 'eac3', str(work / 'raw.eac3')], check=True)
+        # The MP4 muxer needs parsed E-AC-3 packets before it writes a fragment,
+        # and the first one goes into the moov: use the second.
+        subprocess.run([FFMPEG, '-v', 'error', '-y', '-i', str(work / 'raw.eac3'), '-c', 'copy', '-f', 'mp4',
+                        '-movflags', 'frag_keyframe+default_base_moof', '-frag_duration', '1000000',
+                        str(work / 'ec3.mp4')], check=True)
+        data = (work / 'ec3.mp4').read_bytes()
+        moof = next((p, s) for k, p, s in smooth.boxes(data) if k == b'moof')
+        mdat = next((p, s) for k, p, s in smooth.boxes(data) if k == b'mdat' and p > moof[0])
+        stream = smooth.Stream('audio', 'dd', 'u', 48000, 'eng', [smooth.QualityLevel(384000, 'EC-3', channels=6)])
+        self.assertTrue(stream.supported())
+        self.assertEqual(smooth.audio_codec_string(stream.levels[0]), 'ec-3')
+        frag = data[moof[0]:moof[0] + moof[1]] + data[mdat[0]:mdat[0] + mdat[1]]
+        (work / 'smooth-ec3.mp4').write_bytes(smooth.build_init(stream, stream.levels[0]) + smooth.prepare_fragment(frag, 0, None))
+        probe = subprocess.run([FFPROBE, '-v', 'error', '-show_entries', 'stream=codec_name,channels', '-of', 'csv=p=0',
+                                str(work / 'smooth-ec3.mp4')], capture_output=True, text=True, check=True)
+        self.assertEqual(probe.stdout.strip(), 'eac3,6')
 
     async def test_encrypted_segment_without_key_fails_cleanly(self):
         session = self.make_session(encrypt=True)

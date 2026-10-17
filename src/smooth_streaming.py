@@ -19,7 +19,9 @@ from typing import Iterator, Optional
 from urllib.parse import urlsplit
 
 VIDEO_FOURCC = {"H264", "AVC1", "X264", "DAVC"}
-AUDIO_FOURCC = {"AACL", "AACH", "MP4A"}
+AUDIO_FOURCC = {"AACL", "AACH", "MP4A", "EC-3", "AC-3"}
+TEXT_FOURCC = {"TTML", "DFXP"}
+DOLBY_ENTRY = {"EC-3": b"ec-3", "AC-3": b"ac-3"}
 PIFF_UUID = bytes.fromhex("a2394f525a9b4f14a2446c427c648df4")
 MATRIX = struct.pack(">9I", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
 AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
@@ -59,7 +61,7 @@ class Stream:
     chunks: list[tuple[int, int]] = field(default_factory=list)  # (t, d) in timescale
 
     def supported(self) -> bool:
-        allowed = {"video": VIDEO_FOURCC, "audio": AUDIO_FOURCC}.get(self.kind, set())
+        allowed = {"video": VIDEO_FOURCC, "audio": AUDIO_FOURCC, "text": TEXT_FOURCC}.get(self.kind, set())
         return bool(self.levels) and self.levels[0].fourcc in allowed
 
     def template(self, level: QualityLevel, query: str = "") -> str:
@@ -218,6 +220,10 @@ def avc_codec_string(level: QualityLevel) -> str:
         return "avc1"
 
 
+def audio_codec_string(level: QualityLevel) -> str:
+    return {"EC-3": "ec-3", "AC-3": "ac-3", "AACH": "mp4a.40.5"}.get(level.fourcc, "mp4a.40.2")
+
+
 def build_init(stream: Stream, level: QualityLevel) -> bytes:
     """``ftyp+moov`` for a single track (track_ID 1) synthesized from the manifest."""
     ts = stream.timescale
@@ -228,6 +234,12 @@ def build_init(stream: Stream, level: QualityLevel) -> bytes:
             bytes(32), struct.pack(">Hh", 0x18, -1), _avcc(level))
         handler, media_header = b"vide", fbox(b"vmhd", 1, bytes(8))
         volume, size = 0, struct.pack(">II", level.width << 16, level.height << 16)
+    elif level.fourcc in DOLBY_ENTRY:
+        # No dac3/dec3: FFmpeg reads the stream parameters from the syncframes.
+        entry = box(DOLBY_ENTRY[level.fourcc], bytes(6), struct.pack(">H", 1), bytes(8),
+                    struct.pack(">HHHHI", 2, 16, 0, 0, (level.sampling_rate & 0xFFFF) << 16))
+        handler, media_header = b"soun", fbox(b"smhd", 0, bytes(4))
+        volume, size = 0x100, bytes(8)
     else:
         idx = AAC_RATES.index(level.sampling_rate) if level.sampling_rate in AAC_RATES else 3
         asc = level.codec_private or struct.pack(">H", (2 << 11) | (idx << 7) | (level.channels << 3))

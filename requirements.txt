@@ -6,3 +6,4 @@ wheel
 requests
 PySocks
 pycryptodome
+pillow

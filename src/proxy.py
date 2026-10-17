@@ -36,6 +36,7 @@ from aiohttp_socks import ProxyConnector, ProxyError, ProxyTimeoutError
 import aiohttp
 
 import smooth_streaming as smooth
+import subtitles
 
 
 def _home() -> Path:
@@ -463,12 +464,24 @@ def iso639(lang: str) -> str:
     return "und"
 
 
+def is_text_set(aset: ET.Element) -> bool:
+    reps = aset.findall(qtag("Representation"))
+    codecs = " ".join([aset.get("codecs") or ""] + [r.get("codecs") or "" for r in reps]).lower()
+    mimes = " ".join([aset.get("mimeType") or ""] + [r.get("mimeType") or "" for r in reps]).lower()
+    return (aset.get("contentType") == "text" or "stpp" in codecs or "wvtt" in codecs
+            or "ttml" in mimes or "vtt" in mimes)
+
+
 def select_tracks(
     mpd: bytes,
     max_height: int,
     keys: Optional[dict[str, str]] = None,
+    texts: Optional[list[DashTrack]] = None,
 ) -> tuple[Optional[DashTrack], list[DashTrack]]:
     """Pick the highest video rendition across all AdaptationSets.
+
+    Every audio set comes along (Spanish first). When ``texts`` is a list, it
+    receives every clear subtitle set (TTML/WebVTT) as a "text" track.
 
     Some providers split AVC/HEVC into two ladders that both advertise the same
     maxHeight (1080). Ranking by AdaptationSet maxHeight therefore selected
@@ -477,7 +490,7 @@ def select_tracks(
     """
     root = ET.fromstring(mpd)
     parents = {child: parent for parent in root.iter() for child in parent}
-    video_sets, audio_sets = [], []
+    video_sets, audio_sets, text_sets = [], [], []
     for aset in root.iter(qtag("AdaptationSet")):
         if is_iframe_set(aset):
             continue
@@ -487,21 +500,23 @@ def select_tracks(
             video_sets.append(aset)
         elif ctype == "audio" or mime.startswith("audio/"):
             audio_sets.append(aset)
+        elif is_text_set(aset):
+            text_sets.append(aset)
 
     def from_pair(aset: ET.Element, kind: str, rep: ET.Element) -> Optional[DashTrack]:
-        stempl = aset.find(qtag("SegmentTemplate"))
+        stempl = rep.find(qtag("SegmentTemplate"))
+        if stempl is None:
+            stempl = aset.find(qtag("SegmentTemplate"))
         if stempl is None:
             return None
         entries, timescale = expand_timeline(stempl)
         base = inherited_base_url(rep, parents)
+        init = stempl.get("initialization") or ""
         return DashTrack(
             kind=kind,
             rep_id=rep.get("id") or "",
             timescale=timescale,
-            init_rel=urljoin(
-                base,
-                fill_template(stempl.get("initialization") or "", rep.get("id") or ""),
-            ),
+            init_rel=urljoin(base, fill_template(init, rep.get("id") or "")) if init else "",
             media_tmpl=urljoin(base, stempl.get("media") or ""),
             kid=adaptation_kid(aset),
             entries=entries,
@@ -554,6 +569,15 @@ def select_tracks(
             continue
         seen.add(rid)
         audios.append(track)
+    if texts is not None:
+        for aset in sorted(text_sets, key=lambda a: iso639(a.get("lang") or "") != "spa"):
+            reps = aset.findall(qtag("Representation"))
+            if not reps or adaptation_kid(aset) or aset.find(qtag("ContentProtection")) is not None:
+                continue  # encrypted subtitles are not supported
+            track = from_pair(aset, "text", reps[0])
+            if track is not None and track.rep_id not in seen:
+                seen.add(track.rep_id)
+                texts.append(track)
     return video, audios
 
 
@@ -562,9 +586,11 @@ def select_smooth_tracks(
     max_height: int,
     keys: Optional[dict[str, str]] = None,
     url: str = "",
+    texts: Optional[list[DashTrack]] = None,
 ) -> tuple[Optional[DashTrack], list[DashTrack]]:
     """Smooth Streaming counterpart of select_tracks: best video under the height
-    cap, every AAC audio stream (Spanish first), expressed as DashTracks."""
+    cap, every AAC/AC-3/E-AC-3 audio stream (Spanish first) and, into ``texts``,
+    every TTML stream, expressed as DashTracks."""
     parsed = smooth.parse_manifest(manifest)
     query = urlparse(url).query
     scheme = "playready" if parsed.protected else ""
@@ -579,12 +605,13 @@ def select_smooth_tracks(
             media_tmpl=stream.template(level, query),
             kid=parsed.kid,
             entries=stream.chunks[-16:],
-            codecs=smooth.avc_codec_string(level) if is_video else "mp4a.40.2",
+            codecs=(smooth.avc_codec_string(level) if is_video else smooth.audio_codec_string(level)
+                    if stream.kind == "audio" else "ttml"),
             height=level.height,
             bandwidth=level.bitrate,
             lang=stream.lang,
             protection_scheme=scheme,
-            init_data=smooth.build_init(stream, level),
+            init_data=smooth.build_init(stream, level) if stream.kind != "text" else b"",
             smooth=True,
         )
 
@@ -613,7 +640,32 @@ def select_smooth_tracks(
         if track.rep_id not in seen:
             seen.add(track.rep_id)
             audios.append(track)
+    if texts is not None:
+        text_streams = [s for s in parsed.streams if s.kind == "text" and s.supported()]
+        for stream in sorted(text_streams, key=lambda s: iso639(s.lang) != "spa"):
+            track = make(stream, max(stream.levels, key=lambda lv: lv.bitrate))
+            if track.rep_id not in seen:
+                seen.add(track.rep_id)
+                texts.append(track)
     return video, audios
+
+
+_PILLOW: Optional[bool] = None
+
+
+def subtitles_enabled(cfg: dict) -> bool:
+    """Subtitles need Pillow to draw the DVB bitmaps; ``"subtitles": false`` turns them off."""
+    if not cfg.get("subtitles", True):
+        return False
+    global _PILLOW
+    if _PILLOW is None:
+        try:
+            import PIL  # noqa: F401
+            _PILLOW = True
+        except ImportError:
+            _PILLOW = False
+            log.warning("subtitulos desactivados: falta Pillow (pip install pillow)")
+    return _PILLOW
 
 
 def nearest_audio(video: DashTrack, t: int, audio: DashTrack) -> Optional[tuple[int, int]]:
@@ -1305,6 +1357,8 @@ class ChannelSession:
         self.mpd_body = b""
         self.video: Optional[DashTrack] = None
         self.audios: list[DashTrack] = []
+        self.texts: list[DashTrack] = []
+        self._text_failed: set[str] = set()
         self.hls_dir = Path(cfg["hls_dir"]) / ch.slug
         empty_dir(self.hls_dir)
         self.locks: dict[int, asyncio.Lock] = {}
@@ -1365,18 +1419,21 @@ class ChannelSession:
                 self.mpd_at = time.monotonic()
                 return
             max_height = int(self.cfg.get("max_height", 0))
+            texts: Optional[list[DashTrack]] = [] if subtitles_enabled(self.cfg) else None
             if self.ch.is_smooth:
                 try:
-                    video, audios = select_smooth_tracks(body, max_height, self.ch.keys, self.ch.url)
+                    video, audios = select_smooth_tracks(body, max_height, self.ch.keys, self.ch.url, texts)
                 except (smooth.SmoothError, ET.ParseError) as exc:
                     raise web.HTTPBadGateway(text=f"manifiesto Smooth no valido: {exc}")
             else:
-                video, audios = select_tracks(body, max_height, self.ch.keys)
+                video, audios = select_tracks(body, max_height, self.ch.keys, texts)
+            texts = texts or []
             if video is None or not video.entries:
                 raise web.HTTPBadGateway(text="MPD sin video")
             prev = self.video.rep_id if self.video else None
-            prev_audio = tuple(a.rep_id for a in self.audios)
-            new_audio = tuple(a.rep_id for a in audios)
+            # Subtitle streams are part of the TS layout: a change resets it like audio.
+            prev_audio = tuple(a.rep_id for a in self.audios + self.texts)
+            new_audio = tuple(a.rep_id for a in audios + texts)
             if prev and (prev != video.rep_id or prev_audio != new_audio):
                 self.generation += 1
                 for path in self.hls_dir.glob("seg_*.ts"):
@@ -1392,18 +1449,19 @@ class ChannelSession:
                 self.next_seq = 1
                 self._skip_t.clear()
                 self._fail_t.clear()
-            self.video, self.audios = video, audios
+            self.video, self.audios, self.texts = video, audios, texts
             self.mpd_body = body
             self.mpd_at = time.monotonic()
             if prev != video.rep_id or prev_audio != new_audio:
                 log.info(
-                    "tracks %s video=%s %s %dkbit %s audio=%s",
+                    "tracks %s video=%s %s %dkbit %s audio=%s subs=%s",
                     self.ch.slug,
                     video.rep_id,
                     format_quality(video.height, video.fps),
                     video.bandwidth // 1000,
                     video.codecs,
-                    ",".join(f"{a.lang or 'und'}:{a.rep_id}" for a in audios) or "-",
+                    ",".join(f"{a.lang or 'und'}:{a.rep_id}:{a.codecs}" for a in audios) or "-",
+                    ",".join(f"{s.lang or 'und'}:{s.rep_id}" for s in texts) or "-",
                 )
 
     def _refresh_interval(self) -> float:
@@ -1435,6 +1493,33 @@ class ChannelSession:
                 smooth.prepare_fragment, frag, t, bytes.fromhex(hexkey) if hexkey else None)
         except smooth.SmoothError as exc:
             raise web.HTTPBadGateway(text=f"smooth: {exc}")
+
+    async def _text_cues(self, track: DashTrack, start: Fraction, end: Fraction) -> list[subtitles.Cue]:
+        """Cues of a subtitle track for [start, end) seconds. Subtitles are
+        optional: any failure leaves the segment without them, never stalls it."""
+        chunks = [(t, d) for t, d in track.entries
+                  if Fraction(t, track.timescale) < end and Fraction(t + d, track.timescale) > start]
+        if not chunks:
+            return []
+        try:
+            timescale = track.timescale
+            if track.init_rel:
+                init = await self.origin.fetch_rel(self.ch, track.init_rel, use_init_cache=True)
+                timescale = subtitles.init_timescale(init) or timescale
+            frags = await gather_owned(*[
+                self.origin.fetch_rel(self.ch, fill_template(track.media_tmpl, track.rep_id, t)) for t, _d in chunks
+            ])
+        except (web.HTTPException, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            if track.rep_id not in self._text_failed:
+                self._text_failed.add(track.rep_id)
+                log.warning("subs %s %s: %s", self.ch.slug, track.rep_id, getattr(exc, "text", None) or exc)
+            return []
+        cues = []
+        for frag, (t, d) in zip(frags, chunks):
+            # Chunk times are in the track timescale; fragment times in the media one.
+            scale = Fraction(timescale, track.timescale)
+            cues += subtitles.segment_cues(frag, timescale, int(t * scale), int(d * scale))
+        return subtitles.merge(cues)
 
     def closed_entries(self) -> list[tuple[int, int]]:
         assert self.video is not None
@@ -1569,6 +1654,11 @@ class ChannelSession:
                     self.origin.fetch_rel(self.ch, vrel),
                 ))
 
+            seg_start, seg_end = Fraction(t, video.timescale), Fraction(t + duration, video.timescale)
+
+            async def _all_text() -> list[list[subtitles.Cue]]:
+                return list(await asyncio.gather(*[self._text_cues(s, seg_start, seg_end) for s in self.texts]))
+
             async def _all_audio() -> list[tuple[DashTrack, bytes, bytes]]:
                 parts: list[tuple[DashTrack, bytes, bytes]] = []
                 if audio_jobs:
@@ -1587,7 +1677,7 @@ class ChannelSession:
             # Watched channels take free download slots before warm, unwatched ones.
             async with (sem.slot(self.watched()) if isinstance(sem, PrioritySemaphore) else sem):
                 # Video and audio downloads overlap: one round trip per segment, not two.
-                (vinit, vseg), audio_parts = await gather_owned(_video_pair(), _all_audio())
+                (vinit, vseg), audio_parts, text_cues = await gather_owned(_video_pair(), _all_audio(), _all_text())
             if self.stopped:
                 raise web.HTTPBadGateway(text="canal parado")
             tmpdir = self.hls_dir / f".tmp-{t}"
@@ -1676,13 +1766,24 @@ class ChannelSession:
             ]
             for _audio, adec in ready_audio:
                 mux += ["-i", str(adec)]
+            texts = list(zip(self.texts, text_cues))
+            for i, (track, cues) in enumerate(texts):
+                # DVB subtitles, with a clock relative to the segment start.
+                sub = tmpdir / f"s{i}.ts"
+                sub.write_bytes(await asyncio.to_thread(
+                    subtitles.segment_ts, cues, float(seg_start), float(seg_end), iso639(track.lang)))
+                mux += ["-itsoffset", f"{float(seg_start) - subtitles.TS_BASE:.6f}", "-i", str(sub)]
             mux += ["-map", "0:v:0"]
             for i in range(len(ready_audio)):
                 mux += ["-map", f"{i + 1}:a:0"]
+            for i in range(len(texts)):
+                mux += ["-map", f"{len(ready_audio) + i + 1}:s:0"]
             mux += ["-c", "copy", "-bsf:v", self.bsf()]
             for i, (audio, _adec) in enumerate(ready_audio):
                 mux += [f"-metadata:s:a:{i}", f"language={iso639(audio.lang)}"]
                 mux += [f"-disposition:a:{i}", "default" if i == 0 else "0"]
+            for i, (track, _cues) in enumerate(texts):
+                mux += [f"-metadata:s:s:{i}", f"language={iso639(track.lang)}", f"-disposition:s:{i}", "0"]
             mux += [
                 "-muxdelay",
                 "0",

@@ -52,6 +52,7 @@ Actualmente el proxy incluye, entre otras cosas:
 - Remux con FFmpeg usando `-c copy`, sin transcodificación.
 - Selección automática de calidad con límite configurable.
 - Selección de audio.
+- Subtítulos TTML/WebVTT convertidos a subtítulos DVB.
 - Listas M3U como entrada.
 - `#KODIPROP:inputstream.adaptive.license_key`.
 - ClearKey en formato KID/KEY, JSON y JWK.
@@ -82,6 +83,7 @@ Actualmente el proxy incluye, entre otras cosas:
 - [Sincronía de audio y vídeo](#sincronía-de-audio-y-vídeo)
 - [Selección de vídeo](#selección-de-vídeo)
 - [Selección de audio](#selección-de-audio)
+- [Subtítulos](#subtítulos)
 - [Seguimiento del directo](#seguimiento-del-directo)
 - [Reintentos y segmentos que todavía no existen](#reintentos-y-segmentos-que-todavía-no-existen)
 - [Caché](#caché)
@@ -226,7 +228,7 @@ Si la URL contiene `.mpd` (por ejemplo `canal.ism/.mpd`) se trata como DASH.
 
 Un fragmento Smooth es un `moof+mdat` suelto, y para llevarlo a MPEG-TS hacen falta tres cosas que DASH ya trae resueltas:
 
-1. **No hay init segment.** Se sintetiza un `ftyp+moov` desde `CodecPrivateData` (avcC para H.264, esds para AAC).
+1. **No hay init segment.** Se sintetiza un `ftyp+moov` desde `CodecPrivateData` (avcC para H.264, esds para AAC; para AC-3/E-AC-3 basta la entrada `ac-3`/`ec-3`, FFmpeg lee los parámetros de las tramas).
 2. **No hay `tfdt`.** Se inserta el tiempo absoluto del manifiesto en cada fragmento, igual que el `$Time$` de DASH, así que el reloj común y el offset de MPEG-TS funcionan sin cambios.
 3. **Los chunks de audio y vídeo no coinciden.** Cada chunk de audio se asigna al segmento de vídeo en el que empieza, de modo que el audio queda cubierto una sola vez, sin huecos ni solapes.
 
@@ -236,7 +238,7 @@ Las URLs se construyen con la plantilla `QualityLevels({bitrate})/Fragments(vide
 
 Los fragmentos cifrados (`senc` o la caja `uuid` PIFF, AES-CTR) se descifran en Python con la clave que se haya configurado, sin Shaka Packager. Se usa el KID de `ProtectionHeader` para elegir la clave; si no coincide con ninguno, se usa la primera. El proxy **no** pide licencias ni obtiene claves. Si un fragmento está cifrado y el canal no tiene clave, el segmento falla con un error explícito en vez de producir vídeo corrupto.
 
-Limitaciones de Smooth: solo H.264 y AAC (`AACL`/`AACH`), sin HEVC, Dolby ni subtítulos; y la calidad de vídeo se elige al arrancar la sesión.
+Se pasan todas las pistas de audio AAC (`AACL`/`AACH`), AC-3 y E-AC-3 (`AC-3`/`EC-3`) y todas las de subtítulos TTML (ver [Subtítulos](#subtítulos)). Limitaciones de Smooth: vídeo solo H.264 (sin HEVC), y la calidad de vídeo se elige al arrancar la sesión.
 
 ---
 
@@ -364,6 +366,32 @@ como en los segmentos TS de HLS, con su etiqueta de idioma.
 El reproductor puede aplicar su propia preferencia de idioma. Procesar más
 pistas aumenta las descargas y el trabajo por segmento; un fallo de audio
 mantiene los reintentos existentes para evitar publicar segmentos incompletos.
+
+---
+
+# Subtítulos
+
+Desde la versión 1.2.0 se incluyen todas las pistas de subtítulos de texto, con
+el español primero:
+
+- DASH: `AdaptationSet` de texto en fMP4 (`stpp` TTML, `wvtt` WebVTT) o
+  segmentos TTML/WebVTT sueltos, siempre que no estén cifrados;
+- Smooth: `StreamIndex Type="text"` con `FourCC="TTML"`.
+
+Un MPEG-TS no admite subtítulos de texto: FFmpeg los escribiría como datos
+opacos que VLC, ExoPlayer/TiviMate o Kodi no muestran. Por eso el proxy lee los
+textos y sus tiempos, los dibuja con Pillow (texto blanco con borde negro, en un
+lienzo 1920x1080 que el reproductor escala) y los codifica como **subtítulos
+DVB** (ETSI EN 300 743), que FFmpeg copia en el TS con su etiqueta de idioma.
+Cada segmento empieza repitiendo lo que hay en pantalla, así que un cliente que
+entra a mitad de una frase la ve igual. No vienen activados por defecto: se
+eligen en el reproductor.
+
+Los subtítulos son opcionales: si su descarga falla, el segmento sale igual sin
+texto y no se reintenta ni se retrasa el vídeo. Necesitan `pillow`
+(`requirements.txt`); sin Pillow, o con `"subtitles": false` en `config.json`,
+se ignoran. Las pistas de subtítulos en imagen (PNG dentro de TTML) no se
+admiten.
 
 ---
 
@@ -1005,6 +1033,7 @@ Las opciones principales:
 | `origin` | Origin global. |
 | `default_ua` | User-Agent por defecto. |
 | `max_height` | Resolución vertical máxima preferida. |
+| `subtitles` | `false` desactiva los subtítulos (por defecto activos si hay Pillow). |
 | `idle_seconds` | Tiempo antes de cerrar un canal sin clientes. |
 | `max_channels` | Máximo de sesiones activas. |
 | `origin_concurrency` | Límite de trabajo simultáneo contra el origen. |
@@ -1156,9 +1185,9 @@ A día de hoy:
 
 - el parser está orientado principalmente a `SegmentTemplate` y `SegmentTimeline`;
 - el flujo principal trabaja con segmentos identificados por `$Time$`;
-- la salida normal utiliza una pista de audio;
 - se prioriza `lang="spa"`;
-- el remux de vídeo está pensado para H.264 y HEVC (en Smooth solo H.264 y AAC);
+- el remux de vídeo está pensado para H.264 y HEVC (en Smooth solo H.264);
+- los subtítulos de texto se convierten a DVB en imagen, sin estilos ni posición del original;
 - no hay transcodificación;
 - no hay cliente de licencias DRM;
 - no se obtienen claves;
