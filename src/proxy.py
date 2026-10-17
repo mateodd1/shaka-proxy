@@ -933,6 +933,12 @@ class TokenStore:
 
 
 CDN_BODY_MAX = 10 * 1024 * 1024
+# Sanity floors for produced media. Outputs are renamed into place atomically,
+# so these only reject empty or broken results. A still image (holding card,
+# match not started) yields 2 s fragments of only a few KB; larger floors
+# discarded those segments and cut playback.
+MIN_SEGMENT_BYTES = 188 * 50  # ~2 s of 25 fps video, one TS packet per frame
+MIN_VIDEO_BYTES = 2000
 CDN_REQ_SEC = 8.0
 INIT_BODY_MAX = 2 * 1024 * 1024
 
@@ -1392,7 +1398,7 @@ class ChannelSession:
         for t, d in sorted(self._published.items()):
             path = self.hls_dir / f"seg_{t}.ts"
             try:
-                ok = path.is_file() and path.stat().st_size > 40000
+                ok = path.is_file() and path.stat().st_size > MIN_SEGMENT_BYTES
             except OSError:
                 ok = False
             if ok:
@@ -1468,10 +1474,10 @@ class ChannelSession:
         await self.refresh()
         assert self.video is not None
         out = self.hls_dir / f"seg_{t}.ts"
-        if out.is_file() and out.stat().st_size > 40000:
+        if out.is_file() and out.stat().st_size > MIN_SEGMENT_BYTES:
             return out
         async with self._segment_work(t):
-            if out.is_file() and out.stat().st_size > 40000:
+            if out.is_file() and out.stat().st_size > MIN_SEGMENT_BYTES:
                 return out
             video = self.video
             duration = next((d for timestamp, d in video.entries if timestamp == t), None)
@@ -1570,7 +1576,7 @@ class ChannelSession:
                 log.warning("shaka %s t=%s video %s", self.ch.slug, t, vres)
                 raise web.HTTPBadGateway(text="no se pudo descifrar")
             vrc, verr = vres
-            if vrc != 0 or not vdec.is_file() or vdec.stat().st_size < 20000:
+            if vrc != 0 or not vdec.is_file() or vdec.stat().st_size < MIN_VIDEO_BYTES:
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 log.warning("shaka %s t=%s rc=%s %s", self.ch.slug, t, vrc, (verr or b"")[-400:])
                 raise web.HTTPBadGateway(text="no se pudo descifrar")
@@ -1640,7 +1646,7 @@ class ChannelSession:
             if self.stopped:
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 raise web.HTTPBadGateway(text="canal parado")
-            if rc != 0 or not tmp_out.is_file() or tmp_out.stat().st_size < 40000:
+            if rc != 0 or not tmp_out.is_file() or tmp_out.stat().st_size < MIN_SEGMENT_BYTES:
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 log.warning("mux %s t=%s rc=%s %s", self.ch.slug, t, rc, (err or b"")[-300:])
                 raise web.HTTPBadGateway(text="no se pudo remuxear")
@@ -1772,7 +1778,7 @@ class ChannelSession:
             if t < self._next_t:
                 continue
             path = self.hls_dir / f"seg_{t}.ts"
-            if t in self._skip_t or (path.is_file() and path.stat().st_size > 40000):
+            if t in self._skip_t or (path.is_file() and path.stat().st_size > MIN_SEGMENT_BYTES):
                 self._next_t = t + d
                 continue
             return t, d
@@ -2055,7 +2061,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                     data = path.read_bytes()
                 except OSError:
                     continue
-                if len(data) < 40000:
+                if len(data) < MIN_SEGMENT_BYTES:
                     continue
                 dur = d / timescale
                 if expected_t is not None and t != expected_t:
@@ -2128,7 +2134,7 @@ async def handle_live_seg(request: web.Request) -> web.StreamResponse:
     sess = await state.get_session(slug)
     sess.start_producer()
     path = sess.hls_dir / f"seg_{t}.ts"
-    if not (path.is_file() and path.stat().st_size > 40000):
+    if not (path.is_file() and path.stat().st_size > MIN_SEGMENT_BYTES):
         path = await sess.remux(t)
     return web.FileResponse(
         path,

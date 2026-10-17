@@ -125,32 +125,38 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix='smooth-test-')
-        root = Path(cls.tmp.name)
+        cls.ism, cls.manifest = cls.encode('Stream.ism', 'testsrc2=size=320x180:rate=25',
+                                           'sine=frequency=440:sample_rate=48000')
+        # A still image with silence, like a holding card: tiny fragments.
+        cls.still_ism, cls.still_manifest = cls.encode('Still.ism', 'color=c=black:size=320x180:rate=25',
+                                                       'anullsrc=r=48000:cl=stereo')
+
+    @classmethod
+    def encode(cls, name, video, audio):
+        ism = Path(cls.tmp.name) / name
         subprocess.run(
-            [FFMPEG, '-hide_banner', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25',
-             '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '8',
+            [FFMPEG, '-hide_banner', '-v', 'error', '-f', 'lavfi', '-i', video,
+             '-f', 'lavfi', '-i', audio, '-t', '8',
              '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '50', '-keyint_min', '50', '-sc_threshold', '0',
              '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-f', 'smoothstreaming',
-             '-min_frag_duration', '2000000', '-ism_lookahead', '0', str(root / 'Stream.ism')], check=True)
-        cls.ism = root / 'Stream.ism'
+             '-min_frag_duration', '2000000', '-ism_lookahead', '0', str(ism)], check=True)
         # FFmpeg omits `t` on the first chunk although its files are named after it.
         kind, lines = None, []
-        for line in (cls.ism / 'Manifest').read_text().splitlines():
+        for line in (ism / 'Manifest').read_text().splitlines():
             if '<StreamIndex' in line:
                 kind = 'video' if 'Type="video"' in line else 'audio'
             if line.startswith('<c n="0" d='):
-                first = min(int(p.name.split('=')[1].rstrip(')')) for p in cls.ism.glob(f'*/Fragments({kind}=*)'))
+                first = min(int(p.name.split('=')[1].rstrip(')')) for p in ism.glob(f'*/Fragments({kind}=*)'))
                 line = line.replace('<c n="0"', f'<c n="0" t="{first}"')
             lines.append(line)
-        cls.manifest = '\n'.join(lines).encode()
+        return ism, '\n'.join(lines).encode()
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def make_session(self, keys=None, encrypt=False, manifest=None):
-        root = Path(self.tmp.name)
-        ism = self.ism
+    def make_session(self, keys=None, encrypt=False, manifest=None, ism=None):
+        ism = ism or self.ism
 
         async def fetch(ch, relative, **kwargs):
             data = (ism / relative.split('?')[0]).read_bytes()
@@ -202,6 +208,12 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_encrypted_segments_decrypt_with_channel_key(self):
         session = self.make_session(keys={KID: KEY}, encrypt=True)
+        self.check_continuous(await self.probe(session), frames=100)
+
+    async def test_still_image_segments_are_kept_not_skipped(self):
+        session = self.make_session(keys={KID: KEY}, encrypt=True, manifest=self.still_manifest, ism=self.still_ism)
+        frags = list(self.still_ism.glob('QualityLevels(*)/Fragments(video=*)'))
+        self.assertLess(max(p.stat().st_size for p in frags), 20000)  # below the old floor
         self.check_continuous(await self.probe(session), frames=100)
 
     async def test_encrypted_segment_without_key_fails_cleanly(self):
