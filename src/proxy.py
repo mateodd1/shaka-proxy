@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DASH (cabeceras + ClearKey) -> HLS on-demand, con DVR de 2h."""
+"""DASH y Smooth Streaming (cabeceras + claves) -> HLS/MPEG-TS on-demand, con DVR de 2h."""
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +22,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urljoin, urlparse
@@ -32,6 +33,9 @@ from aiohttp import ClientTimeout, TCPConnector, web
 from aiohttp.abc import AbstractResolver
 from aiohttp_socks import ProxyConnector, ProxyError, ProxyTimeoutError
 import aiohttp
+
+import smooth_streaming as smooth
+
 
 def _home() -> Path:
     env = os.environ.get("PROXY_SHAKA_HOME")
@@ -397,6 +401,9 @@ class DashTrack:
     fps: float = 0.0
     lang: str = ""
     protection_scheme: str = ""
+    # Smooth Streaming: no hay init segment que descargar; se sintetiza del manifiesto.
+    init_data: bytes = b""
+    smooth: bool = False
 
 
 def parse_framerate(raw: Optional[str]) -> float:
@@ -549,6 +556,65 @@ def select_tracks(
     return video, audios
 
 
+def select_smooth_tracks(
+    manifest: bytes,
+    max_height: int,
+    keys: Optional[dict[str, str]] = None,
+    url: str = "",
+) -> tuple[Optional[DashTrack], list[DashTrack]]:
+    """Smooth Streaming counterpart of select_tracks: best video under the height
+    cap, every AAC audio stream (Spanish first), expressed as DashTracks."""
+    parsed = smooth.parse_manifest(manifest)
+    query = urlparse(url).query
+    scheme = "playready" if parsed.protected else ""
+
+    def make(stream: smooth.Stream, level: smooth.QualityLevel) -> DashTrack:
+        is_video = stream.kind == "video"
+        return DashTrack(
+            kind=stream.kind,
+            rep_id=f"{stream.name}-{level.bitrate}",
+            timescale=stream.timescale,
+            init_rel="",
+            media_tmpl=stream.template(level, query),
+            kid=parsed.kid,
+            entries=stream.chunks[-16:],
+            codecs=smooth.avc_codec_string(level) if is_video else "mp4a.40.2",
+            height=level.height,
+            bandwidth=level.bitrate,
+            lang=stream.lang,
+            protection_scheme=scheme,
+            init_data=smooth.build_init(stream, level),
+            smooth=True,
+        )
+
+    def best_level(stream: smooth.Stream, cap: int) -> smooth.QualityLevel:
+        levels = stream.levels
+        if cap > 0:
+            levels = [lv for lv in levels if lv.height <= cap] or levels
+        return max(levels, key=lambda lv: (lv.height, lv.bitrate))
+
+    video = None
+    best = (-1, -1)
+    for stream in parsed.streams:
+        if stream.kind != "video" or not stream.supported():
+            continue
+        level = best_level(stream, max_height)
+        if (level.height, level.bitrate) > best:
+            best = (level.height, level.bitrate)
+            video = make(stream, level)
+    audio_streams = [s for s in parsed.streams if s.kind == "audio" and s.supported()]
+    audio_streams.sort(key=lambda s: iso639(s.lang) != "spa")
+    audios: list[DashTrack] = []
+    seen: set[str] = set()
+    for stream in audio_streams:
+        level = max(stream.levels, key=lambda lv: lv.bitrate)
+        track = make(stream, level)
+        if track.rep_id not in seen:
+            seen.add(track.rep_id)
+            audios.append(track)
+    return video, audios
+
+
 def nearest_audio(video: DashTrack, t: int, audio: DashTrack) -> Optional[tuple[int, int]]:
     if not audio.entries:
         return None
@@ -567,6 +633,7 @@ class Channel:
     referer: str = ""
     extra_headers: dict[str, str] = field(default_factory=dict)
     is_dash: bool = True
+    is_smooth: bool = False
     logo: str = ""
     tvg_id: str = ""
 
@@ -663,6 +730,7 @@ class Playlist:
                     referer=referer,
                     extra_headers=dict(extra),
                     is_dash=".mpd" in url.lower(),
+                    is_smooth=".mpd" not in url.lower() and smooth.is_smooth_url(url),
                     logo=parse_logo(extinf),
                     tvg_id=parse_tvg_id(extinf),
                 )
@@ -1231,7 +1299,14 @@ class ChannelSession:
             if time.monotonic() - self.mpd_at < 1.0 and self.video is not None:
                 return
             body = await self.origin.fetch_mpd(self.ch)
-            video, audios = select_tracks(body, int(self.cfg.get("max_height", 0)), self.ch.keys)
+            max_height = int(self.cfg.get("max_height", 0))
+            if self.ch.is_smooth:
+                try:
+                    video, audios = select_smooth_tracks(body, max_height, self.ch.keys, self.ch.url)
+                except (smooth.SmoothError, ET.ParseError) as exc:
+                    raise web.HTTPBadGateway(text=f"manifiesto Smooth no valido: {exc}")
+            else:
+                video, audios = select_tracks(body, max_height, self.ch.keys)
             if video is None or not video.entries:
                 raise web.HTTPBadGateway(text="MPD sin video")
             prev = self.video.rep_id if self.video else None
@@ -1264,6 +1339,26 @@ class ChannelSession:
                     video.codecs,
                     ",".join(f"{a.lang or 'und'}:{a.rep_id}" for a in audios) or "-",
                 )
+
+    def _audio_entries(self, video: DashTrack, t: int, duration: int, audio: DashTrack) -> list[tuple[int, int]]:
+        """Audio chunks that belong to the video segment starting at t."""
+        if audio.smooth:
+            # Smooth audio/video chunk boundaries differ; see smooth.covering_entries.
+            found = smooth.covering_entries(
+                audio.entries, audio.timescale,
+                Fraction(t, video.timescale), Fraction(t + duration, video.timescale))
+            if found:
+                return found
+        nearest = nearest_audio(video, t, audio)
+        return [nearest] if nearest else []
+
+    def _smooth_fragment(self, track: DashTrack, frag: bytes, t: int) -> bytes:
+        """Decrypt a Smooth fragment and stamp its absolute decode time."""
+        hexkey = pick_key(self.ch.keys, track.kid)
+        try:
+            return smooth.prepare_fragment(frag, t, bytes.fromhex(hexkey) if hexkey else None)
+        except smooth.SmoothError as exc:
+            raise web.HTTPBadGateway(text=f"smooth: {exc}")
 
     def closed_entries(self) -> list[tuple[int, int]]:
         assert self.video is not None
@@ -1369,15 +1464,20 @@ class ChannelSession:
             vrel = fill_template(video.media_tmpl, video.rep_id, t)
             audio_jobs: list[DashTrack] = []
             for audio in self.audios:
-                aent = nearest_audio(video, t, audio)
-                if aent is None:
+                if not self._audio_entries(video, t, duration, audio):
                     raise web.HTTPBadGateway(text="segmento de audio no disponible")
                 audio_jobs.append(audio)
 
             async def _audio_pair(audio: DashTrack) -> tuple[DashTrack, bytes, bytes]:
-                aent = nearest_audio(video, t, audio)
-                assert aent is not None
-                arel = fill_template(audio.media_tmpl, audio.rep_id, aent[0])
+                aents = self._audio_entries(video, t, duration, audio)
+                if audio.smooth:
+                    frags = await gather_owned(*[
+                        self.origin.fetch_rel(self.ch, fill_template(audio.media_tmpl, audio.rep_id, at))
+                        for at, _ad in aents
+                    ])
+                    aseg = b"".join(self._smooth_fragment(audio, frag, at) for frag, (at, _ad) in zip(frags, aents))
+                    return audio, audio.init_data, aseg
+                arel = fill_template(audio.media_tmpl, audio.rep_id, aents[0][0])
                 ainit, aseg = await gather_owned(
                     self.origin.fetch_rel(self.ch, audio.init_rel, use_init_cache=True),
                     self.origin.fetch_rel(self.ch, arel),
@@ -1385,10 +1485,14 @@ class ChannelSession:
                 return audio, ainit, aseg
 
             async with self.origin.work_sem:
-                vinit, vseg = await gather_owned(
-                    self.origin.fetch_rel(self.ch, video.init_rel, use_init_cache=True),
-                    self.origin.fetch_rel(self.ch, vrel),
-                )
+                if video.smooth:
+                    vseg = self._smooth_fragment(video, await self.origin.fetch_rel(self.ch, vrel), t)
+                    vinit = video.init_data
+                else:
+                    vinit, vseg = await gather_owned(
+                        self.origin.fetch_rel(self.ch, video.init_rel, use_init_cache=True),
+                        self.origin.fetch_rel(self.ch, vrel),
+                    )
                 audio_parts: list[tuple[DashTrack, bytes, bytes]] = []
                 if audio_jobs:
                     got = await asyncio.gather(
@@ -1420,16 +1524,20 @@ class ChannelSession:
             packager = self.cfg.get("packager") or str(SCRIPT_DIR / "bin" / "packager")
             keys_arg = shaka_keys_arg(self.ch.keys)
 
-            async def _decrypt(src: Path, kind: str, dest: Path) -> tuple[int, bytes]:
+            async def _decrypt(src: Path, kind: str, dest: Path, track: DashTrack) -> tuple[int, bytes]:
+                if track.smooth:
+                    # Smooth fragments were already decrypted and stamped in Python.
+                    src.replace(dest)
+                    return 0, b""
                 cmd = [packager, f"in={src},stream={kind},out={dest}"]
                 if keys_arg:
                     cmd += ["--enable_raw_key_decryption", "--keys", keys_arg]
                 cmd.append("--quiet")
                 return await run_cmd(cmd)
 
-            decrypt_jobs = [_decrypt(vfile, "video", vdec)]
+            decrypt_jobs = [_decrypt(vfile, "video", vdec, video)]
             for _audio, afile, adec in afiles:
-                decrypt_jobs.append(_decrypt(afile, "audio", adec))
+                decrypt_jobs.append(_decrypt(afile, "audio", adec, _audio))
             decrypt_out = await asyncio.gather(*decrypt_jobs, return_exceptions=True)
             if self.stopped:
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1663,7 +1771,7 @@ class AppState:
         async with self.lock:
             self.playlist.maybe_reload(self.cfg["default_ua"], self.cfg["referer"])
             ch = self.playlist.by_public_id.get(slug) or self.playlist.by_slug.get(slug)
-            if ch is None or not ch.is_dash:
+            if ch is None or not (ch.is_dash or ch.is_smooth):
                 raise web.HTTPNotFound(text="canal no encontrado")
             # Both URL forms must share the same producer and segment cache.
             slug = ch.slug
@@ -1815,7 +1923,7 @@ def render_playlist(playlist: Playlist, cfg: dict) -> str:
     lines = [playlist.header, ""]
     for ch in playlist.channels:
         lines.append(ch.extinf)
-        if ch.is_dash:
+        if ch.is_dash or ch.is_smooth:
             lines.append(channel_url(cfg, ch.slug))
         else:
             lines.append(ch.url)

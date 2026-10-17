@@ -44,6 +44,7 @@ http://127.0.0.1:8090/live/3e7c7e64b3c366ad87d1826a/index.m3u8
 Actualmente el proxy incluye, entre otras cosas:
 
 - DASH en directo a MPEG-TS.
+- **Smooth Streaming (ISM/ISML)** en directo, con la misma salida MPEG-TS/HLS, incluido PlayReady/PIFF con clave del usuario.
 - Resolución de `BaseURL` en los niveles MPD, Period, AdaptationSet y Representation.
 - Salida HLS.
 - Streams CENC/ClearKey mediante Shaka Packager.
@@ -75,6 +76,7 @@ Actualmente el proxy incluye, entre otras cosas:
 
 - [Cómo funciona](#cómo-funciona)
 - [DASH, CENC y ClearKey](#dash-cenc-y-clearkey)
+- [Smooth Streaming (ISM/ISML)](#smooth-streaming-ismisml)
 - [Qué hace Shaka Packager](#qué-hace-shaka-packager)
 - [Qué hace FFmpeg](#qué-hace-ffmpeg)
 - [Sincronía de audio y vídeo](#sincronía-de-audio-y-vídeo)
@@ -207,6 +209,34 @@ Una entrada M3U puede incluir una clave de esta forma:
 El parser también entiende otros formatos habituales, como un objeto JSON KID -> KEY o una estructura JWK ClearKey.
 
 No es necesario que audio y vídeo utilicen la misma clave. Si el MPD usa KID diferentes, el proxy puede pasar varias claves a Shaka.
+
+---
+
+# Smooth Streaming (ISM/ISML)
+
+Además de DASH, el proxy acepta canales **Smooth Streaming**. Se detectan por la URL (`.../canal.ism/Manifest`, `.../canal.isml/manifest`) y se usan igual que un MPD en el M3U de entrada, con los mismos headers, tokens, bind/DNS de egress y claves:
+
+```m3u
+#EXTINF:-1,Canal Smooth
+#KODIPROP:inputstream.adaptive.license_key={kid:key}
+https://host/canal.isml/manifest
+```
+
+Si la URL contiene `.mpd` (por ejemplo `canal.ism/.mpd`) se trata como DASH.
+
+Un fragmento Smooth es un `moof+mdat` suelto, y para llevarlo a MPEG-TS hacen falta tres cosas que DASH ya trae resueltas:
+
+1. **No hay init segment.** Se sintetiza un `ftyp+moov` desde `CodecPrivateData` (avcC para H.264, esds para AAC).
+2. **No hay `tfdt`.** Se inserta el tiempo absoluto del manifiesto en cada fragmento, igual que el `$Time$` de DASH, así que el reloj común y el offset de MPEG-TS funcionan sin cambios.
+3. **Los chunks de audio y vídeo no coinciden.** Cada chunk de audio se asigna al segmento de vídeo en el que empieza, de modo que el audio queda cubierto una sola vez, sin huecos ni solapes.
+
+Las URLs se construyen con la plantilla `QualityLevels({bitrate})/Fragments(video={start time})`, y el query del manifiesto (tokens) se hereda en cada fragmento.
+
+## PlayReady / PIFF
+
+Los fragmentos cifrados (`senc` o la caja `uuid` PIFF, AES-CTR) se descifran en Python con la clave que se haya configurado, sin Shaka Packager. Se usa el KID de `ProtectionHeader` para elegir la clave; si no coincide con ninguno, se usa la primera. El proxy **no** pide licencias ni obtiene claves. Si un fragmento está cifrado y el canal no tiene clave, el segmento falla con un error explícito en vez de producir vídeo corrupto.
+
+Limitaciones de Smooth: solo H.264 y AAC (`AACL`/`AACH`), sin HEVC, Dolby ni subtítulos; y la calidad de vídeo se elige al arrancar la sesión.
 
 ---
 
@@ -1114,7 +1144,7 @@ O contra el módulo instalado:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Algunas pruebas multimedia necesitan FFmpeg/Shaka disponibles. Las pruebas que no los necesitan pueden ejecutarse de forma independiente.
+Algunas pruebas multimedia necesitan FFmpeg/Shaka disponibles (las de Smooth solo necesitan FFmpeg). Las pruebas que no los necesitan pueden ejecutarse de forma independiente.
 
 ---
 
@@ -1128,7 +1158,7 @@ A día de hoy:
 - el flujo principal trabaja con segmentos identificados por `$Time$`;
 - la salida normal utiliza una pista de audio;
 - se prioriza `lang="spa"`;
-- el remux de vídeo está pensado para H.264 y HEVC;
+- el remux de vídeo está pensado para H.264 y HEVC (en Smooth solo H.264 y AAC);
 - no hay transcodificación;
 - no hay cliente de licencias DRM;
 - no se obtienen claves;

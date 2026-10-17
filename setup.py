@@ -3,9 +3,12 @@ from Cython.Build import cythonize
 
 setup(
     name="proxy-shaka",
-    version="1.0.15",
+    version="1.1.0",
     ext_modules=cythonize(
-        [Extension("proxy", ["src/proxy.py"])],
+        [
+            Extension("proxy", ["src/proxy.py"]),
+            Extension("smooth_streaming", ["src/smooth_streaming.py"]),
+        ],
         compiler_directives={
             "language_level": "3",
             "embedsignature": True,
