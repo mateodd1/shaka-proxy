@@ -6,6 +6,7 @@ import asyncio
 import base64
 import gzip
 import hashlib
+import heapq
 import html
 import io
 import json
@@ -978,6 +979,55 @@ async def read_body_limited(resp: aiohttp.ClientResponse, limit: int = CDN_BODY_
     return b"".join(chunks)
 
 
+class PrioritySemaphore:
+    """Semaphore whose urgent waiters are served before the others.
+
+    Origin download slots are shared by every producer. Channels nobody is
+    watching (kept warm after a zap) must not delay the ones being watched.
+    """
+
+    def __init__(self, value: int):
+        self._value = value
+        self._waiters: list[tuple[int, int, asyncio.Future]] = []
+        self._seq = 0
+
+    async def acquire(self, urgent: bool = False) -> None:
+        if self._value > 0 and not any(not f.done() for _p, _s, f in self._waiters):
+            self._value -= 1
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._seq += 1
+        heapq.heappush(self._waiters, (0 if urgent else 1, self._seq, fut))
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self.release()  # granted just before the cancellation
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            _p, _s, fut = heapq.heappop(self._waiters)
+            if not fut.done():
+                fut.set_result(None)
+                return
+        self._value += 1
+
+    @asynccontextmanager
+    async def slot(self, urgent: bool = False):
+        await self.acquire(urgent)
+        try:
+            yield
+        finally:
+            self.release()
+
+    async def __aenter__(self):
+        await self.acquire()
+
+    async def __aexit__(self, *exc):
+        self.release()
+
+
 class DashOrigin:
     def __init__(self, cfg: dict, tokens: TokenStore):
         self.cfg = cfg
@@ -991,7 +1041,7 @@ class DashOrigin:
         # A small amount of parallelism is required to keep several live
         # channels at the edge without overloading the WireGuard uplink.
         concurrency = max(1, int(cfg.get("origin_concurrency", 4)))
-        self.work_sem = asyncio.Semaphore(concurrency)
+        self.work_sem = PrioritySemaphore(concurrency)
 
     def _make_session(self) -> aiohttp.ClientSession:
         timeout = ClientTimeout(total=None, sock_connect=6, sock_read=12)
@@ -1281,6 +1331,10 @@ class ChannelSession:
     def touch(self) -> None:
         self.last_access = time.monotonic()
 
+    def watched(self) -> bool:
+        """Someone is playing it: a TS viewer, or an HLS client polling recently."""
+        return self.viewers > 0 or time.monotonic() - self.last_access < 8.0
+
     def start_producer(self) -> None:
         if self.task is None or self.task.done():
             self.stopped = False
@@ -1529,7 +1583,9 @@ class ChannelSession:
                         parts.append(item)
                 return parts
 
-            async with self.origin.work_sem:
+            sem = self.origin.work_sem
+            # Watched channels take free download slots before warm, unwatched ones.
+            async with (sem.slot(self.watched()) if isinstance(sem, PrioritySemaphore) else sem):
                 # Video and audio downloads overlap: one round trip per segment, not two.
                 (vinit, vseg), audio_parts = await gather_owned(_video_pair(), _all_audio())
             if self.stopped:
