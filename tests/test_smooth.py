@@ -11,7 +11,7 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from Crypto.Cipher import AES
 
@@ -209,6 +209,21 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(proxy.web.HTTPBadGateway) as ctx:
             await session.remux(session.video.entries[0][0])
         self.assertIn('no key', ctx.exception.text)
+
+    async def test_refresh_polls_once_per_chunk_and_skips_unchanged_manifest(self):
+        session = self.make_session()
+        del session.refresh  # use the real method
+        session.video = None
+        session.origin.fetch_mpd = AsyncMock(return_value=self.manifest)
+        with patch.object(proxy, 'select_smooth_tracks', wraps=proxy.select_smooth_tracks) as select:
+            await session.refresh()
+            self.assertAlmostEqual(session._refresh_interval(), 2.0, delta=0.1)
+            await session.refresh()  # inside the interval: no request
+            self.assertEqual(session.origin.fetch_mpd.await_count, 1)
+            session.mpd_at = 0
+            await session.refresh()  # same body: fetched but not parsed again
+            self.assertEqual(session.origin.fetch_mpd.await_count, 2)
+            self.assertEqual(select.call_count, 1)
 
 
 if __name__ == '__main__':

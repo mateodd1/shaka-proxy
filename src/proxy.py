@@ -1246,6 +1246,7 @@ class ChannelSession:
         self.viewers = 0
         self.clients: dict[str, dict] = {}
         self.mpd_at = 0.0
+        self.mpd_body = b""
         self.video: Optional[DashTrack] = None
         self.audios: list[DashTrack] = []
         self.hls_dir = Path(cfg["hls_dir"]) / ch.slug
@@ -1296,9 +1297,13 @@ class ChannelSession:
 
     async def refresh(self) -> None:
         async with self.refresh_lock:
-            if time.monotonic() - self.mpd_at < 1.0 and self.video is not None:
+            if time.monotonic() - self.mpd_at < self._refresh_interval() and self.video is not None:
                 return
             body = await self.origin.fetch_mpd(self.ch)
+            if body == self.mpd_body and self.video is not None:
+                # Unchanged manifest (CDN cache hit): skip parsing and track selection.
+                self.mpd_at = time.monotonic()
+                return
             max_height = int(self.cfg.get("max_height", 0))
             if self.ch.is_smooth:
                 try:
@@ -1328,6 +1333,7 @@ class ChannelSession:
                 self._skip_t.clear()
                 self._fail_t.clear()
             self.video, self.audios = video, audios
+            self.mpd_body = body
             self.mpd_at = time.monotonic()
             if prev != video.rep_id or prev_audio != new_audio:
                 log.info(
@@ -1339,6 +1345,13 @@ class ChannelSession:
                     video.codecs,
                     ",".join(f"{a.lang or 'und'}:{a.rep_id}" for a in audios) or "-",
                 )
+
+    def _refresh_interval(self) -> float:
+        """Smooth live manifests carry the whole DVR window (~170 KB for 2 h) and
+        CDNs cache them for one chunk, so poll once per chunk instead of every second."""
+        if self.ch.is_smooth and self.video is not None and self.video.entries:
+            return min(4.0, max(1.0, self.video.entries[-1][1] / max(self.video.timescale, 1)))
+        return 1.0
 
     def _audio_entries(self, video: DashTrack, t: int, duration: int, audio: DashTrack) -> list[tuple[int, int]]:
         """Audio chunks that belong to the video segment starting at t."""
@@ -1352,11 +1365,13 @@ class ChannelSession:
         nearest = nearest_audio(video, t, audio)
         return [nearest] if nearest else []
 
-    def _smooth_fragment(self, track: DashTrack, frag: bytes, t: int) -> bytes:
-        """Decrypt a Smooth fragment and stamp its absolute decode time."""
+    async def _smooth_fragment(self, track: DashTrack, frag: bytes, t: int) -> bytes:
+        """Decrypt a Smooth fragment and stamp its absolute decode time, off the
+        event loop (a 1080p fragment is a few MB of AES-CTR and box rewriting)."""
         hexkey = pick_key(self.ch.keys, track.kid)
         try:
-            return smooth.prepare_fragment(frag, t, bytes.fromhex(hexkey) if hexkey else None)
+            return await asyncio.to_thread(
+                smooth.prepare_fragment, frag, t, bytes.fromhex(hexkey) if hexkey else None)
         except smooth.SmoothError as exc:
             raise web.HTTPBadGateway(text=f"smooth: {exc}")
 
@@ -1475,8 +1490,8 @@ class ChannelSession:
                         self.origin.fetch_rel(self.ch, fill_template(audio.media_tmpl, audio.rep_id, at))
                         for at, _ad in aents
                     ])
-                    aseg = b"".join(self._smooth_fragment(audio, frag, at) for frag, (at, _ad) in zip(frags, aents))
-                    return audio, audio.init_data, aseg
+                    parts = [await self._smooth_fragment(audio, frag, at) for frag, (at, _ad) in zip(frags, aents)]
+                    return audio, audio.init_data, b"".join(parts)
                 arel = fill_template(audio.media_tmpl, audio.rep_id, aents[0][0])
                 ainit, aseg = await gather_owned(
                     self.origin.fetch_rel(self.ch, audio.init_rel, use_init_cache=True),
@@ -1484,16 +1499,17 @@ class ChannelSession:
                 )
                 return audio, ainit, aseg
 
-            async with self.origin.work_sem:
+            async def _video_pair() -> tuple[bytes, bytes]:
                 if video.smooth:
-                    vseg = self._smooth_fragment(video, await self.origin.fetch_rel(self.ch, vrel), t)
-                    vinit = video.init_data
-                else:
-                    vinit, vseg = await gather_owned(
-                        self.origin.fetch_rel(self.ch, video.init_rel, use_init_cache=True),
-                        self.origin.fetch_rel(self.ch, vrel),
-                    )
-                audio_parts: list[tuple[DashTrack, bytes, bytes]] = []
+                    frag = await self.origin.fetch_rel(self.ch, vrel)
+                    return video.init_data, await self._smooth_fragment(video, frag, t)
+                return tuple(await gather_owned(
+                    self.origin.fetch_rel(self.ch, video.init_rel, use_init_cache=True),
+                    self.origin.fetch_rel(self.ch, vrel),
+                ))
+
+            async def _all_audio() -> list[tuple[DashTrack, bytes, bytes]]:
+                parts: list[tuple[DashTrack, bytes, bytes]] = []
                 if audio_jobs:
                     got = await asyncio.gather(
                         *[_audio_pair(a) for a in audio_jobs],
@@ -1503,7 +1519,12 @@ class ChannelSession:
                         if isinstance(item, Exception):
                             log.warning("audio fetch %s t=%s: %s", self.ch.slug, t, item)
                             raise web.HTTPBadGateway(text="descarga de audio incompleta")
-                        audio_parts.append(item)
+                        parts.append(item)
+                return parts
+
+            async with self.origin.work_sem:
+                # Video and audio downloads overlap: one round trip per segment, not two.
+                (vinit, vseg), audio_parts = await gather_owned(_video_pair(), _all_audio())
             if self.stopped:
                 raise web.HTTPBadGateway(text="canal parado")
             tmpdir = self.hls_dir / f".tmp-{t}"
