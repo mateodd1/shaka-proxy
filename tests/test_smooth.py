@@ -12,6 +12,7 @@ from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from xml.etree import ElementTree as ET
 
 from Crypto.Cipher import AES
 
@@ -106,6 +107,19 @@ class SmoothManifestTests(unittest.TestCase):
     def test_rejects_other_xml(self):
         with self.assertRaises(smooth.SmoothError):
             smooth.parse_manifest(b'<MPD/>')
+
+    def test_live_tail_matches_full_dvr_with_repeats_and_timestamp_jumps(self):
+        root = ET.fromstring(MANIFEST)
+        stream = root.find('StreamIndex')
+        for chunk in stream.findall('c'):
+            stream.remove(chunk)
+        ET.SubElement(stream, 'c', t='1000', d='20', r='10000')
+        ET.SubElement(stream, 'c', t='500000', d='25', r='8')
+        ET.SubElement(stream, 'c', d='30', r='20')
+        body = ET.tostring(root)
+        full = smooth.parse_manifest(body).streams[0].chunks
+        tail = smooth.parse_manifest(body, max_chunks=16).streams[0].chunks
+        self.assertEqual(tail, full[-16:])
 
     def test_audio_chunks_tile_the_video_timeline(self):
         audio = [(0, 19), (19, 20), (39, 20), (59, 21), (80, 20)]  # 1 tick = 1 s, drifting boundaries
@@ -209,9 +223,30 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
         self.check_continuous(await self.probe(session), frames=100)
         self.assertFalse(list(session.hls_dir.glob('.tmp-*')))
 
+    async def test_pyav_segments_remux_with_continuous_clock(self):
+        session = self.make_session()
+        session.cfg['mux_backend'] = 'pyav'
+        self.check_continuous(await self.probe(session), frames=100)
+
     async def test_encrypted_segments_decrypt_with_channel_key(self):
         session = self.make_session(keys={KID: KEY}, encrypt=True)
         self.check_continuous(await self.probe(session), frames=100)
+
+    async def test_cpu_workers_parse_and_decrypt_with_continuous_output(self):
+        origin = proxy.DashOrigin({'cpu_workers': 2}, SimpleNamespace(get=lambda: ''))
+        try:
+            video, audios, texts = await asyncio.get_running_loop().run_in_executor(
+                origin.cpu_pool, proxy.parse_channel_manifest,
+                self.manifest, 1080, {KID: KEY}, 'http://origin/Stream.ism/Manifest', True, False)
+            self.assertEqual(video.height, 180)
+            self.assertTrue(audios)
+            self.assertFalse(texts)
+            session = self.make_session(keys={KID: KEY}, encrypt=True)
+            session.cfg['mux_backend'] = 'pyav'
+            session.origin.cpu_pool = origin.cpu_pool
+            self.check_continuous(await self.probe(session), frames=100)
+        finally:
+            await origin.close()
 
     async def test_still_image_segments_are_kept_not_skipped(self):
         session = self.make_session(keys={KID: KEY}, encrypt=True, manifest=self.still_manifest, ism=self.still_ism)
@@ -264,6 +299,18 @@ class SmoothMediaTests(unittest.IsolatedAsyncioTestCase):
         probe = subprocess.run([FFPROBE, '-v', 'error', '-show_entries', 'stream=codec_name,channels', '-of', 'csv=p=0',
                                 str(work / 'smooth-ec3.mp4')], capture_output=True, text=True, check=True)
         self.assertEqual(probe.stdout.strip(), 'eac3,6')
+        video, _ = proxy.select_smooth_tracks(self.manifest, 1080)
+        t = video.entries[0][0]
+        fragment = (self.ism / proxy.fill_template(video.media_tmpl, video.rep_id, t)).read_bytes()
+        vfile = work / 'pyav-video.mp4'
+        vfile.write_bytes(video.init_data + smooth.prepare_fragment(fragment, 0, None))
+        output = work / 'pyav-eac3.ts'
+        await asyncio.to_thread(proxy.media_mux.remux_mp4, str(vfile),
+                                [(str(work / 'smooth-ec3.mp4'), 'eng')], str(output), 0, video.timescale)
+        probe = subprocess.run([FFPROBE, '-v', 'error', '-select_streams', 'a',
+                                '-show_entries', 'stream=codec_name,channels', '-of', 'csv=p=0',
+                                str(output)], capture_output=True, text=True, check=True)
+        self.assertIn('eac3,6', probe.stdout.splitlines())
 
     async def test_encrypted_segment_without_key_fails_cleanly(self):
         session = self.make_session(encrypt=True)

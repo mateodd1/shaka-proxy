@@ -11,6 +11,8 @@ import html
 import io
 import json
 import logging
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from logging.handlers import RotatingFileHandler
 import os
 import re
@@ -29,14 +31,17 @@ from typing import Optional
 from urllib.parse import quote, urljoin, urlparse
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
+from yarl import URL
 
 from aiohttp import ClientTimeout, TCPConnector, web
 from aiohttp.abc import AbstractResolver
 from aiohttp_socks import ProxyConnector, ProxyError, ProxyTimeoutError
 import aiohttp
+import cython
 
 import smooth_streaming as smooth
 import subtitles
+import media_mux
 
 
 def _home() -> Path:
@@ -591,7 +596,7 @@ def select_smooth_tracks(
     """Smooth Streaming counterpart of select_tracks: best video under the height
     cap, every AAC/AC-3/E-AC-3 audio stream (Spanish first) and, into ``texts``,
     every TTML stream, expressed as DashTracks."""
-    parsed = smooth.parse_manifest(manifest)
+    parsed = smooth.parse_manifest(manifest, max_chunks=16)
     query = urlparse(url).query
     scheme = "playready" if parsed.protected else ""
 
@@ -1080,6 +1085,16 @@ class PrioritySemaphore:
         self.release()
 
 
+def parse_channel_manifest(body: bytes, max_height: int, keys: dict, url: str,
+                           is_smooth: bool, with_subtitles: bool):
+    texts = [] if with_subtitles else None
+    if is_smooth:
+        video, audios = select_smooth_tracks(body, max_height, keys, url, texts)
+    else:
+        video, audios = select_tracks(body, max_height, keys, texts)
+    return video, audios, texts or []
+
+
 class DashOrigin:
     def __init__(self, cfg: dict, tokens: TokenStore):
         self.cfg = cfg
@@ -1089,14 +1104,23 @@ class DashOrigin:
         self.init_cache: dict[tuple[str, str], bytes] = {}
         self._sess_lock = asyncio.Lock()
         self._fails = 0
-        # Limit work per channel, not the whole service to a single segment.
-        # A small amount of parallelism is required to keep several live
-        # channels at the edge without overloading the WireGuard uplink.
+        # Segment download slots are shared across the service. Size this for
+        # the number of live channels and the available origin bandwidth.
         concurrency = max(1, int(cfg.get("origin_concurrency", 4)))
         self.work_sem = PrioritySemaphore(concurrency)
+        self.process_sem = asyncio.Semaphore(max(1, int(cfg.get("media_process_concurrency", 16))))
+        self.transport = cfg.get("origin_transport", "curl")
+        if self.transport not in ("curl", "aiohttp"):
+            raise ValueError("origin_transport debe ser curl o aiohttp")
+        if cfg.get("mux_backend", "ffmpeg") not in ("ffmpeg", "pyav"):
+            raise ValueError("mux_backend debe ser ffmpeg o pyav")
+        cpu_workers = max(0, int(cfg.get("cpu_workers", 0)))
+        self.cpu_pool = (ProcessPoolExecutor(cpu_workers, mp_context=multiprocessing.get_context("spawn"))
+                         if cpu_workers else None)
 
     def _make_session(self) -> aiohttp.ClientSession:
-        timeout = ClientTimeout(total=None, sock_connect=6, sock_read=12)
+        timeout = ClientTimeout(total=CDN_REQ_SEC, sock_connect=5, sock_read=CDN_REQ_SEC)
+        connections = max(1, int(self.cfg.get("origin_connections", 512)))
         bind = (self.cfg.get("egress_bind") or "").strip()
         dns = (self.cfg.get("egress_dns") or "").strip()
         proxy = (self.cfg.get("proxy_url") or "").strip()
@@ -1105,24 +1129,25 @@ class DashOrigin:
             connector = TCPConnector(
                 family=socket.AF_INET,
                 local_addr=(bind, 0),
-                limit=8,
+                limit=connections,
                 ttl_dns_cache=30,
-                force_close=True,
                 enable_cleanup_closed=True,
                 resolver=resolver,
             )
-        elif proxy:
+        elif proxy and urlparse(proxy).scheme.startswith("socks"):
+            scheme = urlparse(proxy).scheme
+            remote_dns = scheme in ("socks5h", "socks4a")
+            proxy = proxy.replace("socks5h://", "socks5://", 1).replace("socks4a://", "socks4://", 1)
             connector = ProxyConnector.from_url(
                 socks_ipv4_url(proxy),
-                rdns=False,
+                rdns=remote_dns,
                 family=socket.AF_INET,
-                limit=8,
+                limit=connections,
             )
         else:
             connector = TCPConnector(
                 family=socket.AF_INET,
-                limit=8,
-                force_close=True,
+                limit=connections,
                 enable_cleanup_closed=True,
             )
         return aiohttp.ClientSession(connector=connector, timeout=timeout)
@@ -1131,7 +1156,7 @@ class DashOrigin:
         bind = (self.cfg.get("egress_bind") or "").strip()
         dns = (self.cfg.get("egress_dns") or "").strip()
         if bind:
-            log.info("egress wg bind=%s dns=%s curl", bind, dns or "system")
+            log.info("egress wg bind=%s dns=%s transport=%s", bind, dns or "system", self.transport)
         self.session = None
 
     async def recycle(self) -> None:
@@ -1153,8 +1178,25 @@ class DashOrigin:
 
     async def _note_fail(self) -> None:
         self._fails += 1
-        if self._fails >= 2:
+        # A pooled HTTP connector replaces broken connections itself. Closing
+        # the shared pool after one channel fails would interrupt every channel.
+        if self._fails >= 2 and self.transport == "curl":
             await self.recycle()
+
+    async def _http_hop(self, url: str, headers: dict[str, str]) -> tuple[int, bytes, str, str]:
+        async with self._sess_lock:
+            if self.session is None or self.session.closed:
+                self.session = self._make_session()
+            session = self.session
+        # Preserve signed URLs and Smooth fragment paths exactly. Redirects
+        # are resolved by _get so the final manifest remains the media base.
+        proxy = (self.cfg.get("proxy_url") or "").strip()
+        http_proxy = (proxy if not self.cfg.get("egress_bind") and
+                      urlparse(proxy).scheme in ("http", "https") else None)
+        async with session.get(URL(url, encoded=True), headers=headers,
+                               proxy=http_proxy, allow_redirects=False) as resp:
+            body = await read_body_limited(resp)
+            return resp.status, body, str(resp.url), resp.headers.get("Location", "")
 
     async def _curl_hop(self, url: str, headers: dict[str, str]) -> tuple[int, bytes, str, str]:
         bind = (self.cfg.get("egress_bind") or "").strip()
@@ -1242,7 +1284,8 @@ class DashOrigin:
             try:
                 current = url
                 for _hop in range(6):
-                    status, body, final, loc = await self._curl_hop(current, headers)
+                    hop = self._http_hop if self.transport == "aiohttp" else self._curl_hop
+                    status, body, final, loc = await hop(current, headers)
                     if loc and status in (301, 302, 303, 307, 308):
                         current = urljoin(str(final), loc)
                         continue
@@ -1279,6 +1322,9 @@ class DashOrigin:
                 await asyncio.wait_for(sess.close(), timeout=2)
             except Exception:
                 pass
+        pool, self.cpu_pool = self.cpu_pool, None
+        if pool is not None:
+            await asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=True)
 
     def headers_for(self, ch: Channel) -> dict[str, str]:
         token = self.tokens.get() or ch.extra_headers.get("x-tcdn-token", "")
@@ -1365,6 +1411,7 @@ class ChannelSession:
         self._lock_users: dict[int, int] = {}
         self.refresh_lock = asyncio.Lock()
         self.sem = asyncio.Semaphore(2)
+        self._media_sem = getattr(origin, "process_sem", asyncio.Semaphore(16))
         self.stopped = False
         self.task: Optional[asyncio.Task] = None
         self._workers: set[asyncio.Task] = set()
@@ -1381,6 +1428,10 @@ class ChannelSession:
         self._edge_seen: Optional[int] = None
         self._edge_since = time.monotonic()
         self.window = max(3, int(cfg.get("hls_window", self.WINDOW)))
+        self.download_wait_s = 0.0
+        self.download_s = 0.0
+        self.processing_s = 0.0
+        self.expired_segments = 0
 
     def touch(self) -> None:
         self.last_access = time.monotonic()
@@ -1419,15 +1470,17 @@ class ChannelSession:
                 self.mpd_at = time.monotonic()
                 return
             max_height = int(self.cfg.get("max_height", 0))
-            texts: Optional[list[DashTrack]] = [] if subtitles_enabled(self.cfg) else None
-            if self.ch.is_smooth:
-                try:
-                    video, audios = select_smooth_tracks(body, max_height, self.ch.keys, self.ch.url, texts)
-                except (smooth.SmoothError, ET.ParseError) as exc:
-                    raise web.HTTPBadGateway(text=f"manifiesto Smooth no valido: {exc}")
-            else:
-                video, audios = select_tracks(body, max_height, self.ch.keys, texts)
-            texts = texts or []
+            args = (body, max_height, self.ch.keys, self.ch.url, self.ch.is_smooth,
+                    subtitles_enabled(self.cfg))
+            try:
+                pool = getattr(self.origin, "cpu_pool", None)
+                if pool is None:
+                    video, audios, texts = parse_channel_manifest(*args)
+                else:
+                    video, audios, texts = await asyncio.get_running_loop().run_in_executor(
+                        pool, parse_channel_manifest, *args)
+            except (smooth.SmoothError, ET.ParseError) as exc:
+                raise web.HTTPBadGateway(text=f"manifiesto no valido: {exc}")
             if video is None or not video.entries:
                 raise web.HTTPBadGateway(text="MPD sin video")
             prev = self.video.rep_id if self.video else None
@@ -1489,8 +1542,12 @@ class ChannelSession:
         event loop (a 1080p fragment is a few MB of AES-CTR and box rewriting)."""
         hexkey = pick_key(self.ch.keys, track.kid)
         try:
-            return await asyncio.to_thread(
-                smooth.prepare_fragment, frag, t, bytes.fromhex(hexkey) if hexkey else None)
+            key = bytes.fromhex(hexkey) if hexkey else None
+            pool = getattr(self.origin, "cpu_pool", None)
+            if pool is not None:
+                return await asyncio.get_running_loop().run_in_executor(
+                    pool, smooth.prepare_fragment, frag, t, key)
+            return await asyncio.to_thread(smooth.prepare_fragment, frag, t, key)
         except smooth.SmoothError as exc:
             raise web.HTTPBadGateway(text=f"smooth: {exc}")
 
@@ -1594,7 +1651,7 @@ class ChannelSession:
         # Include queued and awakened waiters, even while lock.locked() is false.
         self._lock_users[t] = self._lock_users.get(t, 0) + 1
         try:
-            async with lock:
+            async with lock, self.sem:
                 try:
                     yield
                 finally:
@@ -1674,10 +1731,15 @@ class ChannelSession:
                 return parts
 
             sem = self.origin.work_sem
+            queued_at = time.monotonic()
             # Watched channels take free download slots before warm, unwatched ones.
             async with (sem.slot(self.watched()) if isinstance(sem, PrioritySemaphore) else sem):
+                download_at = time.monotonic()
+                self.download_wait_s = download_at - queued_at
                 # Video and audio downloads overlap: one round trip per segment, not two.
                 (vinit, vseg), audio_parts, text_cues = await gather_owned(_video_pair(), _all_audio(), _all_text())
+                self.download_s = time.monotonic() - download_at
+            processing_at = time.monotonic()
             if self.stopped:
                 raise web.HTTPBadGateway(text="canal parado")
             tmpdir = self.hls_dir / f".tmp-{t}"
@@ -1707,7 +1769,8 @@ class ChannelSession:
                 if keys_arg:
                     cmd += ["--enable_raw_key_decryption", "--keys", keys_arg]
                 cmd.append("--quiet")
-                return await run_cmd(cmd)
+                async with self._media_sem:
+                    return await run_cmd(cmd)
 
             decrypt_jobs = [_decrypt(vfile, "video", vdec, video)]
             for _audio, afile, adec in afiles:
@@ -1761,11 +1824,14 @@ class ChannelSession:
                 "error",
                 "-nostdin",
                 "-copyts",
+                "-threads",
+                "1",
+                "-nofind_stream_info",
                 "-i",
                 str(vdec),
             ]
             for _audio, adec in ready_audio:
-                mux += ["-i", str(adec)]
+                mux += ["-threads", "1", "-i", str(adec)]
             texts = list(zip(self.texts, text_cues))
             for i, (track, cues) in enumerate(texts):
                 # DVB subtitles, with a clock relative to the segment start.
@@ -1799,7 +1865,21 @@ class ChannelSession:
                 "mpegts",
                 str(tmp_out),
             ]
-            rc, err = await run_cmd(mux)
+            async with self._media_sem:
+                if self.cfg.get("mux_backend", "ffmpeg") == "pyav" and not texts:
+                    args = (str(vdec), [(str(path), iso639(audio.lang)) for audio, path in ready_audio],
+                            str(tmp_out), self.ts_origin_t, max(video.timescale, 1))
+                    pool = getattr(self.origin, "cpu_pool", None)
+                    try:
+                        if pool is None:
+                            await asyncio.to_thread(media_mux.remux_mp4, *args)
+                        else:
+                            await asyncio.get_running_loop().run_in_executor(pool, media_mux.remux_mp4, *args)
+                        rc, err = 0, b""
+                    except Exception as exc:
+                        rc, err = 1, str(exc).encode("utf-8", "replace")
+                else:
+                    rc, err = await run_cmd(mux)
             if self.stopped:
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 raise web.HTTPBadGateway(text="canal parado")
@@ -1813,6 +1893,8 @@ class ChannelSession:
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 raise web.HTTPBadGateway(text="canal parado")
             self._published[t] = duration
+            self._last_mux = time.monotonic()
+            self.processing_s = self._last_mux - processing_at
             shutil.rmtree(tmpdir, ignore_errors=True)
             self._prune_cache()
             return out
@@ -1844,6 +1926,13 @@ class ChannelSession:
             except OSError:
                 pass
 
+    async def _recover_origin(self) -> None:
+        self.mpd_at = 0
+        if getattr(self.origin, "transport", "curl") == "aiohttp":
+            self.origin.cdn_base.pop(self.ch.slug, None)
+        else:
+            await self.origin.recycle()
+
     async def _producer(self) -> None:
         log.info("producer %s", self.ch.slug)
         while not self.stopped:
@@ -1854,7 +1943,7 @@ class ChannelSession:
                 except TimeoutError:
                     log.warning("producer refresh hung %s", self.ch.slug)
                     try:
-                        await asyncio.wait_for(self.origin.recycle(), timeout=4)
+                        await asyncio.wait_for(self._recover_origin(), timeout=4)
                     except Exception:
                         pass
                     await asyncio.sleep(0.3)
@@ -1873,7 +1962,7 @@ class ChannelSession:
                     log.warning("mpd stale %s edge=%s, recycle", self.ch.slug, edge_t)
                     self.mpd_at = 0
                     try:
-                        await asyncio.wait_for(self.origin.recycle(), timeout=5)
+                        await asyncio.wait_for(self._recover_origin(), timeout=5)
                     except Exception:
                         pass
                     self._edge_since = time.monotonic()
@@ -1929,6 +2018,7 @@ class ChannelSession:
         if self._next_t is None:
             self._next_t = self._join_t(closed)
         if self._next_t < closed[0][0]:
+            self.expired_segments += 1
             log.warning("segments expired %s expected=%s available=%s", self.ch.slug, self._next_t, closed[0][0])
             self._next_t = closed[0][0]
         for t, d in closed:
@@ -1972,7 +2062,8 @@ class AppState:
             sess = self.sessions.get(slug)
             if sess is None:
                 live = len(self.sessions)
-                if live >= int(self.cfg.get("max_channels", 6)):
+                max_channels = int(self.cfg.get("max_channels", 6))
+                if max_channels > 0 and live >= max_channels:
                     idle_sessions = [
                         candidate
                         for candidate in self.sessions.values()
@@ -2069,24 +2160,33 @@ class TSContinuity:
     """Each HTTP connection owns counters; shared cached segments stay intact."""
 
     def __init__(self):
-        self.counters: dict[int, int] = {}
+        # 255 means unseen. Fixed PID storage lets the compiled loop rewrite
+        # packets without allocating Python integers or doing a dict lookup.
+        self.counters = bytearray([255]) * 8192
 
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.locals(pos=cython.Py_ssize_t, pid=cython.int, control=cython.int,
+                   cc=cython.int, previous=cython.int)
     def rewrite(self, data: bytes) -> bytes:
         if len(data) % 188:
             raise ValueError("MPEG-TS incompleto")
         output = bytearray(data)
+        buffer: cython.uchar[::1] = output
+        counters: cython.uchar[::1] = self.counters
         for pos in range(0, len(output), 188):
-            if output[pos] != 0x47:
+            if buffer[pos] != 0x47:
                 raise ValueError("MPEG-TS fuera de sincronía")
-            pid = ((output[pos + 1] & 31) << 8) | output[pos + 2]
-            control = (output[pos + 3] >> 4) & 3
+            pid = ((buffer[pos + 1] & 31) << 8) | buffer[pos + 2]
+            control = (buffer[pos + 3] >> 4) & 3
             if pid == 8191 or control == 0:
                 continue
-            cc = output[pos + 3] & 15
-            if pid in self.counters:
-                cc = (self.counters[pid] + bool(control & 1)) & 15
-            output[pos + 3] = (output[pos + 3] & 240) | cc
-            self.counters[pid] = cc
+            cc = buffer[pos + 3] & 15
+            previous = counters[pid]
+            if previous != 255:
+                cc = (previous + bool(control & 1)) & 15
+            buffer[pos + 3] = (buffer[pos + 3] & 240) | cc
+            counters[pid] = cc
         return bytes(output)
 
 
@@ -2364,6 +2464,11 @@ def session_snapshot(state: AppState) -> dict:
                 "clients": clients,
                 "cached": len(list(sess.hls_dir.glob("seg_*.ts"))),
                 "producer": bool(sess.task and not sess.task.done()),
+                "last_segment_age_s": round(now - getattr(sess, "_last_mux", now), 3),
+                "download_wait_s": round(getattr(sess, "download_wait_s", 0.0), 3),
+                "download_s": round(getattr(sess, "download_s", 0.0), 3),
+                "processing_s": round(getattr(sess, "processing_s", 0.0), 3),
+                "expired_segments": getattr(sess, "expired_segments", 0),
                 "height": sess.video.height if sess.video else 0,
                 "fps": round(sess.video.fps, 3) if sess.video and sess.video.fps else 0,
                 "quality": format_quality(

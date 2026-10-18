@@ -662,7 +662,11 @@ script de login/renovación
 
 # Acceso al CDN
 
-Las descargas del origen se hacen actualmente con `curl`.
+Las descargas del origen admiten dos transportes: `curl` (por defecto) y
+`aiohttp` (`"origin_transport": "aiohttp"`). Con muchos canales conviene
+`aiohttp`: reutiliza conexiones HTTP/TLS y caché DNS, y evita arrancar un
+proceso y crear archivos temporales por cada petición. Los dos transportes
+respetan las cabeceras, redirecciones, proxy y salida WireGuard configurados.
 
 Esto permite controlar algunas cosas que son útiles cuando el servidor tiene varias salidas de red:
 
@@ -700,7 +704,9 @@ Puede ser útil con WireGuard, policy routing o servidores con varias interfaces
 "egress_dns": "1.1.1.1"
 ```
 
-Cuando se utiliza junto con `egress_bind`, la resolución puede hacerse usando ese camino de salida y la IP obtenida se pasa después a `curl`.
+Cuando se utiliza junto con `egress_bind`, la resolución se realiza usando ese
+camino de salida. `curl` recibe la IP resuelta; `aiohttp` utiliza el resolver de
+egress y almacena el resultado en su caché DNS.
 
 ---
 
@@ -1035,8 +1041,13 @@ Las opciones principales:
 | `max_height` | Resolución vertical máxima preferida. |
 | `subtitles` | `false` desactiva los subtítulos (por defecto activos si hay Pillow). |
 | `idle_seconds` | Tiempo antes de cerrar un canal sin clientes. |
-| `max_channels` | Máximo de sesiones activas. |
-| `origin_concurrency` | Límite de trabajo simultáneo contra el origen. |
+| `max_channels` | Máximo de sesiones activas; `0` desactiva el límite. |
+| `origin_concurrency` | Máximo global de segmentos descargándose a la vez, compartido entre todos los canales. |
+| `origin_transport` | `curl` (por defecto) o `aiohttp`, con conexiones persistentes. |
+| `origin_connections` | Máximo de conexiones del transporte `aiohttp` (por defecto 512). |
+| `media_process_concurrency` | Máximo global de procesos FFmpeg/Shaka simultáneos (por defecto 16). |
+| `cpu_workers` | Procesos para analizar manifiestos y descifrar Smooth en varios núcleos; `0` usa el proceso principal y sus threads. |
+| `mux_backend` | `ffmpeg` (por defecto) o `pyav`, que remultiplexa dentro de los workers persistentes. Los subtítulos DVB usan FFmpeg. |
 | `cdn_retries` | Reintentos para peticiones al CDN. |
 | `remux_timeout` | Timeout del remux. |
 | `segment_failures_before_skip` | Fallos antes de saltar un segmento. |
@@ -1158,6 +1169,63 @@ Los workers pueden preparar trabajo en paralelo, pero los segmentos se publican 
 Que falle un fragmento no debería tirar todo el canal. Se reintenta y, cuando el fallo persiste más de lo razonable, se puede saltar ese timestamp y continuar.
 
 ---
+
+# Muchos canales simultáneos
+
+Perfil inicial para dimensionar una instancia con hasta 200 canales:
+
+```json
+{
+  "max_channels": 0,
+  "origin_transport": "aiohttp",
+  "origin_concurrency": 256,
+  "origin_connections": 512,
+  "media_process_concurrency": 16,
+  "cpu_workers": 4,
+  "mux_backend": "pyav",
+  "hls_dir": "/dev/shm/shaka-proxy"
+}
+```
+
+Las descargas y los procesos multimedia tienen límites independientes. Así un
+canal puede descargar mientras otros remultiplexan, y una apertura masiva no
+arranca cientos de FFmpeg a la vez. Cada canal admite hasta dos trabajos de
+segmento simultáneos. Un fallo de un canal con `aiohttp` no cierra el pool HTTP
+que utilizan los demás.
+
+`cpu_workers` reparte el análisis de manifiestos y el descifrado Smooth entre
+procesos persistentes para utilizar varios núcleos sin bloquear el servidor
+HTTP. La continuidad MPEG-TS usa un bucle nativo en el módulo compilado.
+
+`mux_backend: "pyav"` utiliza las bibliotecas de FFmpeg en esos mismos procesos,
+evitando arrancar un ejecutable por cada segmento. Conserva las pistas de audio,
+idiomas y el reloj compartido de vídeo/audio. Los segmentos con subtítulos DVB
+siguen utilizando el ejecutable FFmpeg. `av` se instala desde `requirements.txt`.
+
+`/dev/shm` evita escrituras continuas al disco y necesita espacio y RAM para la
+caché y los archivos de trabajo. A 6 Mb/s y seis segmentos de 2 s, 200 canales
+ocupan aproximadamente 1,8 GB solo en segmentos finales. Usa una ruta exclusiva
+para cada instancia: el proxy vacía ese directorio al arrancar y cerrar.
+
+200 canales a 6 Mb/s requieren aproximadamente 1,2 Gb/s de entrada, más audio,
+manifiestos y sobrecarga. Un espectador por canal añade un caudal de salida
+similar. La salida WireGuard, el proveedor y la interfaz física deben sostener
+ese tráfico. Este perfil configura la concurrencia; la capacidad se determina
+con una prueba sobre la red y el contenido utilizados.
+
+`status.json` incluye por canal `download_wait_s`, `download_s`, `processing_s`,
+`last_segment_age_s` y `expired_segments` para localizar colas y retrasos.
+
+La siguiente prueba usa un origen local, manifiestos de dos horas y fragmentos
+1080p cifrados generados a 6 Mb/s. Abre sesiones independientes y clientes TS,
+y ejecuta el descifrado y el motor PyAV reales. No usa el CDN ni la lista del servicio:
+
+```bash
+.venv/bin/python tools/load_channels.py --channels 200 --duration 60 --ramp 20 --report /tmp/shaka-load.json
+```
+
+El resultado mide el procesamiento y transporte local; no mide la capacidad de
+la VPN ni las restricciones del CDN.
 
 # Tests
 

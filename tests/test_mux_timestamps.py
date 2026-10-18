@@ -26,7 +26,10 @@ class MuxTimestampTests(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_audios_survive_remux_in_spanish_first_order(self):
         await self.check_audio_tracks(['eng', 'es-ES', 'cat'])
 
-    async def check_audio_tracks(self, languages):
+    async def test_pyav_preserves_epoch_clock_and_multiple_audios(self):
+        await self.check_audio_tracks(['eng', 'es-ES', 'cat'], backend='pyav')
+
+    async def check_audio_tracks(self, languages, backend='ffmpeg'):
         with tempfile.TemporaryDirectory(prefix='shaka-media-test-') as directory:
             root = Path(directory)
             command = [FFMPEG, '-hide_banner', '-v', 'error',
@@ -58,7 +61,8 @@ class MuxTimestampTests(unittest.IsolatedAsyncioTestCase):
             origin = SimpleNamespace(work_sem=asyncio.Semaphore(1), fetch_rel=fetch)
             session = proxy.ChannelSession(
                 SimpleNamespace(slug='fixture', keys={}),
-                {'hls_dir': str(root/'hls'), 'ffmpeg': FFMPEG, 'packager': str(PACKAGER)}, origin)
+                {'hls_dir': str(root/'hls'), 'ffmpeg': FFMPEG, 'packager': str(PACKAGER),
+                 'mux_backend': backend}, origin)
             session.video, session.audios = video, audio
             session.refresh = AsyncMock()
             session._prune_cache = Mock()

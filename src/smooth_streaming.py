@@ -113,7 +113,9 @@ def protection_kid(header_b64: str) -> Optional[str]:
     return None
 
 
-def parse_manifest(data: bytes) -> Manifest:
+def parse_manifest(data: bytes, max_chunks: Optional[int] = None) -> Manifest:
+    if max_chunks is not None and max_chunks < 1:
+        raise ValueError("max_chunks must be positive")
     root = ET.fromstring(data)
     if root.tag != "SmoothStreamingMedia":
         raise SmoothError(f"not a Smooth Streaming manifest: <{root.tag}>")
@@ -135,14 +137,28 @@ def parse_manifest(data: bytes) -> Manifest:
         ]
         chunks: list[tuple[int, int]] = []
         t = 0
-        for c in si.findall("c"):
+        nodes = si.findall("c")
+        tail_start = 0
+        if max_chunks is not None:
+            needed = max_chunks
+            for index in range(len(nodes) - 1, -1, -1):
+                if _int(nodes[index].get("d")) > 0:
+                    needed -= max(1, _int(nodes[index].get("r"), 1))
+                if needed <= 0:
+                    tail_start = index
+                    break
+        for index, c in enumerate(nodes):
             t = _int(c.get("t"), t)
             d = _int(c.get("d"))
             if d <= 0:
                 continue
-            for _ in range(max(1, _int(c.get("r"), 1))):
-                chunks.append((t, d))
-                t += d
+            count = max(1, _int(c.get("r"), 1))
+            if index >= tail_start:
+                first = max(0, count - max_chunks) if max_chunks is not None else 0
+                chunks.extend((t + offset * d, d) for offset in range(first, count))
+            t += d * count
+        if max_chunks is not None:
+            chunks = chunks[-max_chunks:]
         streams.append(Stream(
             kind=(si.get("Type") or "").lower(),
             name=si.get("Name") or si.get("Type") or "",

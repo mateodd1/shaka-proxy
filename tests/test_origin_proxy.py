@@ -74,6 +74,12 @@ class OriginProxyTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(shutil.which('curl'), 'curl unavailable')
     async def test_real_curl_uses_local_http_and_socks_proxies_despite_no_proxy(self):
+        await self.check_real_proxy_routing('curl')
+
+    async def test_pooled_http_uses_local_http_and_socks_proxies_despite_no_proxy(self):
+        await self.check_real_proxy_routing('aiohttp')
+
+    async def check_real_proxy_routing(self, transport):
         for scheme in ('http', 'socks5', 'socks5h'):
             with self.subTest(scheme=scheme):
                 requests, destinations, tasks = [], [], []
@@ -121,7 +127,8 @@ class OriginProxyTests(unittest.IsolatedAsyncioTestCase):
 
                 server = await asyncio.start_server(connected, '127.0.0.1', 0)
                 port = server.sockets[0].getsockname()[1]
-                origin = self.make_origin(proxy_url=f'{scheme}://127.0.0.1:{port}')
+                origin = self.make_origin(proxy_url=f'{scheme}://127.0.0.1:{port}',
+                                          origin_transport=transport)
                 ch = proxy.Channel('fixture', 'Fixture', '', f'http://{host}/live/Manifest')
                 try:
                     # Explicit proxy configuration must not be bypassed by the environment.

@@ -7,3 +7,4 @@ requests
 PySocks
 pycryptodome
 pillow
+av>=19,<20
