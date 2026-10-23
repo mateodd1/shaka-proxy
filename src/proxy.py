@@ -2430,6 +2430,22 @@ def session_encryption(sess) -> Optional[str]:
     return "DRM"
 
 
+def session_input_type(sess) -> str:
+    if getattr(sess.ch, "is_smooth", False):
+        input_type = "ISML"
+    elif getattr(sess.ch, "is_dash", True):
+        input_type = "DASH"
+    else:
+        input_type = "HTTP"
+
+    encryption = session_encryption(sess)
+    if encryption and encryption.startswith("DRM"):
+        return f"{input_type} · DRM"
+    if encryption == "CLEAR":
+        return f"{input_type} · CLEAR"
+    return input_type
+
+
 def session_snapshot(state: AppState) -> dict:
     now = time.monotonic()
     epg_now = datetime.now(timezone.utc)
@@ -2456,6 +2472,7 @@ def session_snapshot(state: AppState) -> dict:
                     "time": f"{fmt_epg_time(current['start'])}–{fmt_epg_time(current['stop'])}",
                 } if current else None,
                 "encryption": session_encryption(sess),
+                "input_type": session_input_type(sess),
                 "active": fmt_duration(now - sess.started_mono),
                 "active_s": int(now - sess.started_mono),
                 "idle": fmt_duration(now - sess.last_access),
@@ -2716,7 +2733,11 @@ def render_status_page(data: dict) -> str:
       info.append(element('div', 'programme-time', ch.programme.time));
     }
     name.append(info);
-    if (ch.encryption) name.append(element('div', 'encryption', ch.encryption));
+    if (ch.input_type) {
+      const badge = element('div', 'encryption', ch.input_type);
+      if (ch.encryption && ch.encryption !== ch.input_type) badge.title = ch.encryption;
+      name.append(badge);
+    } else if (ch.encryption) name.append(element('div', 'encryption', ch.encryption));
     nameCell.append(name);
     summary.append(nameCell);
     summary.append(cell('Activo', 'mono', duration(ch.active_s)));

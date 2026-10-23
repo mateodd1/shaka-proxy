@@ -836,7 +836,7 @@ Entre los datos disponibles están:
 
 La programación se actualiza sin recargar la página. La guía se carga en segundo plano y se reutiliza entre consultas; si no hay un programa vigente en la EPG, se muestra solo el nombre del canal. No se analiza el vídeo: la información corresponde a la programación de ese canal en la guía.
 
-Cuando el MPD declara cifrado, el estado muestra `DRM · ClearKey` si el proxy utiliza claves ClearKey, sin exponer claves ni identificadores. Si las pistas ya se han inspeccionado y no declaran cifrado, muestra `CLEAR`. La etiqueta aparece centrada a la derecha del nombre y del programa, sin aumentar la altura de la fila; mientras todavía no se conocen las pistas, no aparece ninguna etiqueta.
+El badge de estado muestra el formato de entrada y el cifrado, por ejemplo `DASH · DRM` o `ISML · DRM`; los streams sin cifrar muestran `DASH · CLEAR` o `ISML · CLEAR`. Antes de inspeccionar las pistas muestra solo el formato (`DASH` o `ISML`). El detalle de cifrado (`DRM · ClearKey`, cuando corresponda) queda disponible al pasar el cursor, y `/status.json` conserva el campo `encryption` sin exponer claves ni identificadores. La etiqueta aparece centrada a la derecha del nombre y del programa, sin aumentar la altura de la fila.
 
 ---
 
