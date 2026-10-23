@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ctypes
+import gc
 import gzip
 import hashlib
 import heapq
@@ -13,6 +15,7 @@ import json
 import logging
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
+from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 import os
 import re
@@ -255,6 +258,9 @@ def cenc_attr(name: str) -> str:
 def load_config() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
         cfg = json.load(fh)
+    cfg.setdefault("cdn_token_enabled", True)
+    if not isinstance(cfg["cdn_token_enabled"], bool):
+        raise ValueError("cdn_token_enabled debe ser true o false")
     for key in ("source_m3u", "token_file", "packager", "hls_dir", "log_dir"):
         value = cfg.get(key)
         if value and not Path(value).is_absolute():
@@ -999,6 +1005,20 @@ MIN_SEGMENT_BYTES = 188 * 50  # ~2 s of 25 fps video, one TS packet per frame
 MIN_VIDEO_BYTES = 2000
 CDN_REQ_SEC = 8.0
 INIT_BODY_MAX = 2 * 1024 * 1024
+INIT_CACHE_MAX_BYTES = 16 * 1024 * 1024
+INIT_CACHE_MAX_ENTRIES = 128
+
+
+def release_idle_memory() -> None:
+    """Collect idle-session cycles and return unused libc pages on supported systems."""
+    gc.collect()
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (AttributeError, OSError):
+        return
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    trim(0)
 
 
 def abort_connector(connector) -> None:
@@ -1101,7 +1121,7 @@ class DashOrigin:
         self.tokens = tokens
         self.session: Optional[aiohttp.ClientSession] = None
         self.cdn_base: dict[str, str] = {}
-        self.init_cache: dict[tuple[str, str], bytes] = {}
+        self.init_cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
         self._sess_lock = asyncio.Lock()
         self._fails = 0
         # Segment download slots are shared across the service. Size this for
@@ -1325,9 +1345,28 @@ class DashOrigin:
         pool, self.cpu_pool = self.cpu_pool, None
         if pool is not None:
             await asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=True)
+        self.init_cache.clear()
+        self.cdn_base.clear()
+
+    def forget_channel(self, slug: str) -> None:
+        self.cdn_base.pop(slug, None)
+        for key in list(self.init_cache):
+            if key[0] == slug:
+                self.init_cache.pop(key)
+
+    def _remember_init(self, slug: str, rel: str, data: bytes) -> None:
+        key = (slug, rel)
+        self.init_cache[key] = data
+        self.init_cache.move_to_end(key)
+        size = sum(map(len, self.init_cache.values()))
+        while (len(self.init_cache) > INIT_CACHE_MAX_ENTRIES
+               or size > INIT_CACHE_MAX_BYTES):
+            _, evicted = self.init_cache.popitem(last=False)
+            size -= len(evicted)
 
     def headers_for(self, ch: Channel) -> dict[str, str]:
-        token = self.tokens.get() or ch.extra_headers.get("x-tcdn-token", "")
+        token_enabled = self.cfg.get("cdn_token_enabled", True)
+        token = (self.tokens.get() or ch.extra_headers.get("x-tcdn-token", "")) if token_enabled else ""
         headers = {
             "User-Agent": ch.ua or self.cfg["default_ua"],
             "Origin": self.cfg["origin"],
@@ -1338,7 +1377,7 @@ class DashOrigin:
         if token:
             headers["x-tcdn-token"] = token
         for key, value in ch.extra_headers.items():
-            if key.lower() == "x-tcdn-token" and token:
+            if key.lower() == "x-tcdn-token" and (not token_enabled or token):
                 continue
             headers[key] = value
         return headers
@@ -1360,6 +1399,7 @@ class DashOrigin:
         if use_init_cache:
             cached = self.init_cache.get((ch.slug, rel))
             if cached:
+                self.init_cache.move_to_end((ch.slug, rel))
                 return cached
         base = self.cdn_base.get(ch.slug)
         if not base:
@@ -1373,7 +1413,7 @@ class DashOrigin:
             if status == 200 and data:
                 if use_init_cache:
                     if 64 < len(data) <= INIT_BODY_MAX:
-                        self.init_cache[(ch.slug, rel)] = data
+                        self._remember_init(ch.slug, rel, data)
                     return data
                 if len(data) < 256:
                     await asyncio.sleep(delay)
@@ -1458,6 +1498,16 @@ class ChannelSession:
             worker.cancel()
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        self.mpd_body = b""
+        self.video = None
+        self.audios.clear()
+        self.texts.clear()
+        self._published.clear()
+        self.t_to_seq.clear()
+        self._skip_t.clear()
+        self._fail_t.clear()
+        self.locks.clear()
+        self._lock_users.clear()
         empty_dir(self.hls_dir)
 
     async def refresh(self) -> None:
@@ -1664,6 +1714,67 @@ class ChannelSession:
             if not self._lock_users[t]:
                 self._lock_users.pop(t)
 
+    # Keep segment helpers on the session rather than inside _remux. In the
+    # compiled build, nested functions retain their shared scope (including
+    # vseg/audio_parts) through reference cycles until cyclic GC runs.
+    async def _fetch_audio_pair(
+        self, video: DashTrack, t: int, duration: int, audio: DashTrack,
+    ) -> tuple[DashTrack, bytes, bytes]:
+        entries = self._audio_entries(video, t, duration, audio)
+        if audio.smooth:
+            fragments = await gather_owned(*[
+                self.origin.fetch_rel(self.ch, fill_template(audio.media_tmpl, audio.rep_id, at))
+                for at, _duration in entries
+            ])
+            parts = [await self._smooth_fragment(audio, fragment, at)
+                     for fragment, (at, _duration) in zip(fragments, entries)]
+            return audio, audio.init_data, b"".join(parts)
+        rel = fill_template(audio.media_tmpl, audio.rep_id, entries[0][0])
+        init, segment = await gather_owned(
+            self.origin.fetch_rel(self.ch, audio.init_rel, use_init_cache=True),
+            self.origin.fetch_rel(self.ch, rel),
+        )
+        return audio, init, segment
+
+    async def _fetch_video_pair(self, video: DashTrack, t: int) -> tuple[bytes, bytes]:
+        rel = fill_template(video.media_tmpl, video.rep_id, t)
+        if video.smooth:
+            fragment = await self.origin.fetch_rel(self.ch, rel)
+            return video.init_data, await self._smooth_fragment(video, fragment, t)
+        init, segment = await gather_owned(
+            self.origin.fetch_rel(self.ch, video.init_rel, use_init_cache=True),
+            self.origin.fetch_rel(self.ch, rel),
+        )
+        return init, segment
+
+    async def _fetch_all_audio(
+        self, video: DashTrack, t: int, duration: int, audios: list[DashTrack],
+    ) -> list[tuple[DashTrack, bytes, bytes]]:
+        try:
+            return await gather_owned(*[
+                self._fetch_audio_pair(video, t, duration, audio) for audio in audios
+            ])
+        except Exception as exc:
+            log.warning("audio fetch %s t=%s: %s", self.ch.slug, t, exc)
+            raise web.HTTPBadGateway(text="descarga de audio incompleta") from None
+
+    async def _fetch_all_text(self, start: Fraction, end: Fraction) -> list[list[subtitles.Cue]]:
+        return await gather_owned(*[self._text_cues(track, start, end) for track in self.texts])
+
+    async def _decrypt_track(
+        self, src: Path, kind: str, dest: Path, track: DashTrack,
+        packager: str, keys_arg: str,
+    ) -> tuple[int, bytes]:
+        if track.smooth:
+            src.replace(dest)
+            return 0, b""
+        cmd = [packager, f"in={src},stream={kind},out={dest}"]
+        if keys_arg:
+            cmd += ["--enable_raw_key_decryption", "--keys", keys_arg]
+        cmd.append("--quiet")
+        async with self._media_sem:
+            return await run_cmd(cmd)
+
     async def _remux(self, t: int) -> Path:
         if self.stopped:
             raise web.HTTPBadGateway(text="canal parado")
@@ -1676,59 +1787,20 @@ class ChannelSession:
             if out.is_file() and out.stat().st_size > MIN_SEGMENT_BYTES:
                 return out
             video = self.video
-            duration = next((d for timestamp, d in video.entries if timestamp == t), None)
+            duration = None
+            for timestamp, entry_duration in video.entries:
+                if timestamp == t:
+                    duration = entry_duration
+                    break
             if duration is None:
                 raise web.HTTPBadGateway(text="segmento fuera del manifiesto; reintentar")
-            vrel = fill_template(video.media_tmpl, video.rep_id, t)
             audio_jobs: list[DashTrack] = []
             for audio in self.audios:
                 if not self._audio_entries(video, t, duration, audio):
                     raise web.HTTPBadGateway(text="segmento de audio no disponible")
                 audio_jobs.append(audio)
 
-            async def _audio_pair(audio: DashTrack) -> tuple[DashTrack, bytes, bytes]:
-                aents = self._audio_entries(video, t, duration, audio)
-                if audio.smooth:
-                    frags = await gather_owned(*[
-                        self.origin.fetch_rel(self.ch, fill_template(audio.media_tmpl, audio.rep_id, at))
-                        for at, _ad in aents
-                    ])
-                    parts = [await self._smooth_fragment(audio, frag, at) for frag, (at, _ad) in zip(frags, aents)]
-                    return audio, audio.init_data, b"".join(parts)
-                arel = fill_template(audio.media_tmpl, audio.rep_id, aents[0][0])
-                ainit, aseg = await gather_owned(
-                    self.origin.fetch_rel(self.ch, audio.init_rel, use_init_cache=True),
-                    self.origin.fetch_rel(self.ch, arel),
-                )
-                return audio, ainit, aseg
-
-            async def _video_pair() -> tuple[bytes, bytes]:
-                if video.smooth:
-                    frag = await self.origin.fetch_rel(self.ch, vrel)
-                    return video.init_data, await self._smooth_fragment(video, frag, t)
-                return tuple(await gather_owned(
-                    self.origin.fetch_rel(self.ch, video.init_rel, use_init_cache=True),
-                    self.origin.fetch_rel(self.ch, vrel),
-                ))
-
             seg_start, seg_end = Fraction(t, video.timescale), Fraction(t + duration, video.timescale)
-
-            async def _all_text() -> list[list[subtitles.Cue]]:
-                return list(await asyncio.gather(*[self._text_cues(s, seg_start, seg_end) for s in self.texts]))
-
-            async def _all_audio() -> list[tuple[DashTrack, bytes, bytes]]:
-                parts: list[tuple[DashTrack, bytes, bytes]] = []
-                if audio_jobs:
-                    got = await asyncio.gather(
-                        *[_audio_pair(a) for a in audio_jobs],
-                        return_exceptions=True,
-                    )
-                    for item in got:
-                        if isinstance(item, Exception):
-                            log.warning("audio fetch %s t=%s: %s", self.ch.slug, t, item)
-                            raise web.HTTPBadGateway(text="descarga de audio incompleta")
-                        parts.append(item)
-                return parts
 
             sem = self.origin.work_sem
             queued_at = time.monotonic()
@@ -1737,7 +1809,11 @@ class ChannelSession:
                 download_at = time.monotonic()
                 self.download_wait_s = download_at - queued_at
                 # Video and audio downloads overlap: one round trip per segment, not two.
-                (vinit, vseg), audio_parts, text_cues = await gather_owned(_video_pair(), _all_audio(), _all_text())
+                (vinit, vseg), audio_parts, text_cues = await gather_owned(
+                    self._fetch_video_pair(video, t),
+                    self._fetch_all_audio(video, t, duration, audio_jobs),
+                    self._fetch_all_text(seg_start, seg_end),
+                )
                 self.download_s = time.monotonic() - download_at
             processing_at = time.monotonic()
             if self.stopped:
@@ -1748,6 +1824,7 @@ class ChannelSession:
             tmpdir.mkdir(parents=True, exist_ok=True)
             vfile = tmpdir / "v.mp4"
             vfile.write_bytes(vinit + vseg)
+            vinit = vseg = b""
             afiles: list[tuple[DashTrack, Path, Path]] = []
             for i, (audio, ainit, aseg) in enumerate(audio_parts):
                 if not ainit or not aseg:
@@ -1756,25 +1833,15 @@ class ChannelSession:
                 afile.write_bytes(ainit + aseg)
                 adec = tmpdir / f"adec{i}.mp4"
                 afiles.append((audio, afile, adec))
+            audio_parts.clear()
+            ainit = aseg = b""
             vdec = tmpdir / "vdec.mp4"
             packager = self.cfg.get("packager") or str(SCRIPT_DIR / "bin" / "packager")
             keys_arg = shaka_keys_arg(self.ch.keys)
 
-            async def _decrypt(src: Path, kind: str, dest: Path, track: DashTrack) -> tuple[int, bytes]:
-                if track.smooth:
-                    # Smooth fragments were already decrypted and stamped in Python.
-                    src.replace(dest)
-                    return 0, b""
-                cmd = [packager, f"in={src},stream={kind},out={dest}"]
-                if keys_arg:
-                    cmd += ["--enable_raw_key_decryption", "--keys", keys_arg]
-                cmd.append("--quiet")
-                async with self._media_sem:
-                    return await run_cmd(cmd)
-
-            decrypt_jobs = [_decrypt(vfile, "video", vdec, video)]
+            decrypt_jobs = [self._decrypt_track(vfile, "video", vdec, video, packager, keys_arg)]
             for _audio, afile, adec in afiles:
-                decrypt_jobs.append(_decrypt(afile, "audio", adec, _audio))
+                decrypt_jobs.append(self._decrypt_track(afile, "audio", adec, _audio, packager, keys_arg))
             decrypt_out = await asyncio.gather(*decrypt_jobs, return_exceptions=True)
             if self.stopped:
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -2046,7 +2113,7 @@ class AppState:
         self.cfg = cfg
         self.playlist = Playlist(cfg["source_m3u"])
         self.epg = EPG(cfg, self.playlist)
-        self.tokens = TokenStore(cfg["token_file"])
+        self.tokens = TokenStore(cfg.get("token_file") or str(SCRIPT_DIR / "token.json"))
         self.origin = DashOrigin(cfg, self.tokens)
         self.sessions: dict[str, ChannelSession] = {}
         self.lock = asyncio.Lock()
@@ -2086,6 +2153,7 @@ class AppState:
         if sess is None:
             return
         await sess.stop()
+        self.origin.forget_channel(slug)
         empty_dir(sess.hls_dir)
         try:
             sess.hls_dir.rmdir()
@@ -2097,6 +2165,9 @@ class AppState:
             except OSError:
                 pass
         log.info("suelto %s", slug)
+        del sess
+        if not self.sessions:
+            await asyncio.to_thread(release_idle_memory)
 
     async def reaper(self) -> None:
         idle = float(self.cfg.get("idle_seconds", 30))
@@ -2497,8 +2568,9 @@ def session_snapshot(state: AppState) -> dict:
                 ),
             }
         )
-    token = state.tokens.get()
-    exp = state.tokens.exp
+    token_enabled = getattr(state, "cfg", {}).get("cdn_token_enabled", True)
+    token = state.tokens.get() if token_enabled else ""
+    exp = state.tokens.exp if token_enabled else None
     token_left = None
     if exp:
         token_left = int(exp - time.time())
@@ -2506,6 +2578,7 @@ def session_snapshot(state: AppState) -> dict:
         "channels_total": len(state.playlist.channels),
         "open": len(live),
         "live": live,
+        "cdn_token_enabled": token_enabled,
         "token_ok": bool(token),
         "token_left_s": token_left,
         "now": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -2541,6 +2614,7 @@ def render_status_page(data: dict) -> str:
   header { margin-bottom: 22px; }
   h1 { margin: 0; font-size: 1.45rem; letter-spacing: -.025em; }
   .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .cards.no-token { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .card {
     min-width: 0; padding: 15px 16px; border: 1px solid var(--line); border-radius: 14px;
     background: linear-gradient(145deg, rgba(27,34,44,.95), rgba(18,23,31,.95));
@@ -2599,7 +2673,8 @@ def render_status_page(data: dict) -> str:
   [hidden] { display: none !important; }
   noscript p { padding: 12px; color: var(--amber); background: #332812; border-radius: 10px; }
   @media (max-width: 860px) {
-    .cards { grid-template-columns: 1fr 1fr; }
+    .cards, .cards.no-token { grid-template-columns: 1fr 1fr; }
+    .cards.no-token .card:nth-child(3) { grid-column: 1 / -1; }
     .table-wrap { border: 0; background: transparent; overflow: visible; }
     thead { display: none; }
     table, tbody, tr, td { display: block; width: 100%; }
@@ -2648,11 +2723,11 @@ def render_status_page(data: dict) -> str:
 <body>
 <main>
   <header><h1>Shaka-proxy</h1></header>
-  <div class="cards">
+  <div class="cards__TOKEN_LAYOUT__">
     <div class="card"><div class="k">Canales abiertos</div><div id="open" class="v">—</div></div>
     <div class="card"><div class="k">Espectadores</div><div id="viewers" class="v">—</div></div>
     <div class="card"><div class="k">En la lista</div><div id="total" class="v">—</div></div>
-    <div id="token-card" class="card"><div class="k">Token CDN</div><div id="token" class="v">—</div></div>
+    <div id="token-card" class="card"__TOKEN_HIDDEN__><div class="k">Token CDN</div><div id="token" class="v">—</div></div>
   </div>
   <div class="section-head"><h2>Actividad</h2></div>
   <div class="table-wrap">
@@ -2796,10 +2871,18 @@ def render_status_page(data: dict) -> str:
     byId('open').textContent = String(Number(data.open) || 0);
     byId('viewers').textContent = String(live.reduce((sum, ch) => sum + (Number(ch.viewers) || 0), 0));
     byId('total').textContent = String(Number(data.channels_total) || 0);
-    const left = data.token_left_s;
     const tokenCard = byId('token-card');
-    tokenCard.classList.toggle('warning', !data.token_ok || left === null || Number(left) < 1800);
-    byId('token').textContent = !data.token_ok ? 'No disponible' : left === null ? 'Desconocido' : Number(left) <= 0 ? 'Caducado' : duration(left);
+    const tokenEnabled = data.cdn_token_enabled !== false;
+    tokenCard.hidden = !tokenEnabled;
+    tokenCard.parentElement.classList.toggle('no-token', !tokenEnabled);
+    if (tokenEnabled) {
+      const left = data.token_left_s;
+      tokenCard.classList.toggle('warning', !data.token_ok || left === null || Number(left) < 1800);
+      byId('token').textContent = !data.token_ok ? 'No disponible' : left === null ? 'Desconocido' : Number(left) <= 0 ? 'Caducado' : duration(left);
+    } else {
+      tokenCard.classList.remove('warning');
+      byId('token').textContent = '—';
+    }
     const fragment = document.createDocumentFragment();
     const slugs = new Set(live.map(ch => ch.slug));
     expanded.forEach(slug => { if (!slugs.has(slug)) expanded.delete(slug); });
@@ -2841,7 +2924,10 @@ def render_status_page(data: dict) -> str:
 </body>
 </html>
 """
-    return page.replace("__INITIAL_DATA__", initial_json)
+    token_enabled = data.get("cdn_token_enabled", True)
+    return (page.replace("__TOKEN_LAYOUT__", "" if token_enabled else " no-token")
+            .replace("__TOKEN_HIDDEN__", "" if token_enabled else " hidden")
+            .replace("__INITIAL_DATA__", initial_json))
 
 
 async def handle_status(request: web.Request) -> web.Response:
@@ -3097,7 +3183,8 @@ async def on_startup(app: web.Application) -> None:
     empty_dir(hls)
     Path(state.cfg["log_dir"]).mkdir(parents=True, exist_ok=True)
     state.playlist.maybe_reload(state.cfg["default_ua"], state.cfg["referer"])
-    state.tokens.get()
+    if state.cfg.get("cdn_token_enabled", True):
+        state.tokens.get()
     await state.origin.start()
     app["reaper"] = asyncio.create_task(state.reaper())
     log.info("escuchando %s:%s  %s canales", state.cfg["listen_host"], state.cfg["listen_port"], len(state.playlist.channels))

@@ -474,7 +474,9 @@ Esa caché la comparten:
 
 Los segmentos antiguos se van eliminando junto con el estado interno que ya no hace falta, de forma que una sesión que permanezca abierta durante mucho tiempo no tenga que conservar todo el historial del canal.
 
-También existe una pequeña caché para los initialization segments, que normalmente no cambian en cada fragmento.
+Los buffers de vídeo y audio de trabajo se liberan al terminar cada segmento, también si el canal sigue abierto durante horas. Los helpers de procesamiento no mantienen referencias circulares a esos buffers en la versión compilada.
+
+La caché compartida de initialization segments tiene un límite de 16 MiB y 128 entradas: descarta primero las menos utilizadas recientemente y elimina las de un canal al cerrar su sesión.
 
 ---
 
@@ -834,6 +836,8 @@ Entre los datos disponibles están:
 
 `/status.json` devuelve la misma clase de información en un formato más cómodo para scripts o monitorización.
 
+`cdn_token_enabled` controla el uso del token CDN y su cuadro en esta página. Por defecto es `true`. Con `false` no se consulta `token_file`, no se envía la cabecera `x-tcdn-token` (tampoco desde la M3U) y el cuadro se oculta desde la primera carga; las otras tres tarjetas se redistribuyen. Cambia el booleano en `config.json` y reinicia la instancia para aplicarlo. Esta opción no modifica las tareas externas de renovación del token.
+
 La programación se actualiza sin recargar la página. La guía se carga en segundo plano y se reutiliza entre consultas; si no hay un programa vigente en la EPG, se muestra solo el nombre del canal. No se analiza el vídeo: la información corresponde a la programación de ese canal en la guía.
 
 El badge de estado muestra el formato de entrada y el cifrado, por ejemplo `DASH · DRM` o `ISML · DRM`; los streams sin cifrar muestran `DASH · CLEAR` o `ISML · CLEAR`. Antes de inspeccionar las pistas muestra solo el formato (`DASH` o `ISML`). El detalle de cifrado (`DRM · ClearKey`, cuando corresponda) queda disponible al pasar el cursor, y `/status.json` conserva el campo `encryption` sin exponer claves ni identificadores. La etiqueta aparece centrada a la derecha del nombre y del programa, sin aumentar la altura de la fila.
@@ -866,7 +870,7 @@ Las sesiones sin clientes se eliminan después de:
 "idle_seconds": 45
 ```
 
-Cuando una sesión se cierra también se detienen su productor y workers y se limpia su caché temporal.
+Cuando una sesión se cierra también se detienen su productor y workers y se limpia su caché temporal, manifiesto y referencias a las pistas. Al cerrar la última sesión se realiza una recolección completa y, en sistemas con `malloc_trim`, se devuelve al sistema la memoria libre del asignador. Esto sucede fuera del bucle de eventos y no se ejecuta por cada fragmento.
 
 ---
 
@@ -994,6 +998,7 @@ Ejemplo:
 
   "source_m3u": "channels.m3u",
   "token_file": "token.json",
+  "cdn_token_enabled": true,
 
   "proxy_url": "",
   "egress_bind": "",
@@ -1032,6 +1037,7 @@ Las opciones principales:
 | `public_base` | URL pública usada al generar enlaces. |
 | `source_m3u` | M3U de entrada. |
 | `token_file` | Archivo del token dinámico. |
+| `cdn_token_enabled` | `true` activa el token CDN y su cuadro de estado; `false` desactiva ambos. Por defecto `true`. |
 | `proxy_url` | Proxy para el acceso al origen. |
 | `egress_bind` | IP local usada para salir hacia el CDN. |
 | `egress_dns` | DNS utilizado con el egress. |
